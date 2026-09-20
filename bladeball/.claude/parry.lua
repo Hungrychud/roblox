@@ -40,172 +40,96 @@ local lastClick = 0
 local firedAt = {}
 local tracked = {}
 local renderConnection = nil
-local keysHeld = {}
 local currentThreat = nil
 local lastPing = 0
 local parryCount = 0
-local guiVisible = true
-local drawings = {}
-local buttons = {}
-local mouse = player:GetMouse()
-local mouseWasDown = false
-local pointerOverGui = false
+local menuOpen = true
+local lastUiUpdate = 0
 
--------------------------------------------------------------------------
--- Matcha Drawing GUI
--------------------------------------------------------------------------
-local GUI = {x = 30, y = 100, w = 320, h = 374, ready = false}
-local layout = {}
-local dragging = false
-local dragX, dragY = 0, 0
-local accent = Color3.fromRGB(104, 220, 190)
-local muted = Color3.fromRGB(143, 156, 175)
+-- Load the user-selected Matcha UI library.
+local fetched, source = pcall(function()
+	return game:HttpGet("https://scripts.wabisabi.mom/wabi-sabi-ui-lib.lua")
+end)
+assert(fetched and type(source) == "string", "Could not download WabiSabi UI")
+local uiChunk, compileError = loadstring(source)
+assert(uiChunk, "Could not compile WabiSabi: " .. tostring(compileError))
+local loadedLibrary = uiChunk()
+local Library = WabiSabi or loadedLibrary
+assert(type(Library) == "table" and type(Library.CreateWindow) == "function", "Invalid WabiSabi UI")
 
-local function setDrawing(object, properties)
-	if not object then return end
-	for key, value in pairs(properties) do pcall(function() object[key] = value end) end
-end
+local Window = Library:CreateWindow({
+	Title = "Matcha",
+	SubTitle = "Auto Parry",
+	Size = Vector2.new(600, 520),
+	Theme = "Ocean",
+	MinimizeKey = "P",
+})
+local Main = Window:AddTab({Title = "Parry"})
+Main:AddParagraph({
+	Title = "Match controls",
+	Content = "Drag the title bar to move. P minimizes the window; T toggles auto parry.\nAuto parry pauses while this window is open.",
+})
+local Controls = Main:AddSection("Features")
+Controls:AddToggle({
+	Id = "AutoParry", Title = "Auto parry", Default = CONFIG.enabled,
+	Keybind = {Default = "T", Mode = "Toggle"},
+	Callback = function(value) CONFIG.enabled = value end,
+})
+Controls:AddToggle({
+	Id = "Clash", Title = "Close-range retries", Default = CONFIG.clashEnabled,
+	Description = "Allow bounded retries during fast, close exchanges.",
+	Callback = function(value) CONFIG.clashEnabled = value end,
+})
+Controls:AddToggle({
+	Id = "Fallback", Title = "Fallback targeting", Default = CONFIG.fallback,
+	Description = "Consider incoming real balls whose target is unknown.",
+	Callback = function(value) CONFIG.fallback = value end,
+})
+Controls:AddToggle({
+	Id = "Ping", Title = "Ping compensation", Default = CONFIG.pingComp,
+	Callback = function(value) CONFIG.pingComp = value end,
+})
+local Status = Main:AddParagraph({Title = "Live status", Content = "Waiting for ball"})
 
-local function draw(kind, x, y, properties)
-	if Drawing == nil then return nil end
-	local ok, object = pcall(function() return Drawing.new(kind) end)
-	if not ok or not object then return nil end
-	drawings[#drawings + 1] = object
-	layout[#layout + 1] = {object = object, x = x, y = y}
-	properties.Position = Vector2.new(GUI.x + x, GUI.y + y)
-	properties.Visible = true
-	properties.Transparency = properties.Transparency or 0
-	setDrawing(object, properties)
-	return object
-end
+local Timing = Window:AddTab({Title = "Timing"})
+Timing:AddSlider({
+	Id = "Lead", Title = "Reaction lead (ms)", Default = CONFIG.baseLead * 1000,
+	Min = 20, Max = CONFIG.maxLead * 1000, Rounding = 0,
+	Callback = function(value) CONFIG.baseLead = value / 1000 end,
+})
+Timing:AddSlider({
+	Id = "Range", Title = "Detection range (studs)", Default = CONFIG.maxRange,
+	Min = 30, Max = 300, Rounding = 0,
+	Callback = function(value) CONFIG.maxRange = value end,
+})
+Timing:AddSlider({
+	Id = "ClashRange", Title = "Close-range distance (studs)", Default = CONFIG.clashRange,
+	Min = 8, Max = 40, Rounding = 0,
+	Callback = function(value) CONFIG.clashRange = value end,
+})
 
-local function rect(x, y, w, h, color, z)
-	return draw("Square", x, y, {Size = Vector2.new(w, h), Filled = true,
-		Color = color, Rounding = 8, ZIndex = z or 2})
-end
-
-local function label(x, y, text, size, color)
-	return draw("Text", x, y, {Text = text, Size = size or 14, Font = 2,
-		Color = color or Color3.fromRGB(229, 236, 244), ZIndex = 5})
-end
-
-local function moveGui(x, y)
-	local camera = Workspace.CurrentCamera
-	local viewport = camera and camera.ViewportSize
-	if viewport then
-		x = math.clamp(x, 0, math.max(0, viewport.X - GUI.w))
-		y = math.clamp(y, 0, math.max(0, viewport.Y - GUI.h))
-	end
-	GUI.x, GUI.y = x, y
-	for _, item in ipairs(layout) do
-		setDrawing(item.object, {Position = Vector2.new(x + item.x, y + item.y)})
-	end
-end
-
-local function toggle(y, title, key)
-	local b = {x = 12, y = y, w = 296, h = 36, key = key}
-	b.box = rect(b.x, b.y, b.w, b.h, Color3.fromRGB(27, 35, 48))
-	label(24, y + 10, title)
-	b.track = rect(252, y + 8, 44, 20, muted, 3)
-	b.knob = rect(255, y + 11, 14, 14, Color3.fromRGB(241, 248, 250), 4)
-	b.knobLayout = layout[#layout]
-	b.action = function() CONFIG[key] = not CONFIG[key] end
-	buttons[#buttons + 1] = b
-end
-
-local function stepper(y, title, key, step, low, high, scale, suffix)
-	local value = label(24, y + 10, "", 14)
-	for _, direction in ipairs({-1, 1}) do
-		local x = direction == -1 and 238 or 274
-		local b = {x = x, y = y, w = 30, h = 30}
-		b.box = rect(x, y, 30, 30, Color3.fromRGB(35, 47, 62))
-		label(x + 10, y + 6, direction == -1 and "-" or "+", 17, accent)
-		b.action = function() CONFIG[key] = math.clamp(CONFIG[key] + direction * step, low, high) end
-		buttons[#buttons + 1] = b
-	end
-	return function()
-		setDrawing(value, {Text = title .. "   " .. math.floor(CONFIG[key] * scale + 0.5) .. suffix})
-	end
-end
-
-rect(4, 5, GUI.w, GUI.h, Color3.fromRGB(7, 10, 16), 0)
-GUI.background = rect(0, 0, GUI.w, GUI.h, Color3.fromRGB(17, 23, 33), 1)
-rect(0, 0, GUI.w, 3, accent, 3)
-GUI.title = label(18, 14, "MATCHA  /  PARRY", 18, accent)
-label(18, 39, "Drag header to move", 12, muted)
-GUI.badge = label(250, 17, "ACTIVE", 12, accent)
-rect(12, 62, 296, 48, Color3.fromRGB(23, 31, 43))
-GUI.status = label(24, 69, "Waiting for ball", 13, muted)
-toggle(120, "Auto parry  [T]", "enabled")
-toggle(160, "Close-range retries", "clashEnabled")
-toggle(200, "Fallback targeting", "fallback")
-toggle(240, "Ping compensation", "pingComp")
-local refreshLead = stepper(284, "Reaction", "baseLead", 0.01, 0.02, CONFIG.maxLead, 1000, " ms")
-local refreshRange = stepper(320, "Range", "maxRange", 10, 30, 300, 1, " studs")
-label(18, 356, "P  show / hide     T  auto parry", 11, muted)
-GUI.ready = GUI.background ~= nil
+local Interface = Window:AddTab({Title = "Interface"})
+Interface:AddDropdown({
+	Title = "Theme", Options = {"Ocean", "Dark", "Aqua", "Amethyst", "Rose", "Darker"},
+	Default = "Ocean", Callback = function(value) Library:SetTheme(value) end,
+})
+Interface:AddButton({
+	Title = "Minimize and play", Callback = function() Library:Minimize() end,
+})
+Interface:AddButton({
+	Title = "Unload script", Callback = function()
+		if _G.BB_MATCHA_STOP then _G.BB_MATCHA_STOP() end
+	end,
+})
+Library:OnMinimized(function(minimized) menuOpen = not minimized end)
 
 local function updateGui()
-	if not GUI.ready then return end
-	for _, object in ipairs(drawings) do setDrawing(object, {Visible = guiVisible}) end
-	if not guiVisible then return end
-	setDrawing(GUI.badge, {Text = CONFIG.enabled and "ACTIVE" or "PAUSED",
-		Color = CONFIG.enabled and accent or muted})
-	local status = currentThreat and string.format("Incoming %.2fs", currentThreat.tti) or "Waiting for ball"
-	setDrawing(GUI.status, {Text = string.format("%s\n%d ms ping   /   %d attempts", status, math.floor(lastPing * 1000), parryCount)})
-	for _, b in ipairs(buttons) do
-		if b.key then
-			local enabled = CONFIG[b.key]
-			setDrawing(b.track, {Color = enabled and accent or Color3.fromRGB(65, 76, 93)})
-			b.knobLayout.x = enabled and 279 or 255
-			setDrawing(b.knob, {Position = Vector2.new(GUI.x + b.knobLayout.x, GUI.y + b.knobLayout.y)})
-		end
-	end
-	refreshLead()
-	refreshRange()
-end
-
--- Matcha's native key polling uses Windows virtual-key numbers.
-local function updateKeys()
-	if type(iskeypressed) ~= "function" then return end
-	local active = type(isrbxactive) ~= "function" or isrbxactive()
-	for _, key in ipairs({80, 84}) do
-		local down = iskeypressed(key)
-		if active and down and not keysHeld[key] then
-			if key == 80 then guiVisible = not guiVisible
-			else
-				CONFIG.enabled = not CONFIG.enabled
-				print("Matcha auto-parry " .. (CONFIG.enabled and "enabled" or "disabled"))
-			end
-		end
-		keysHeld[key] = down
-	end
-end
-
--- Matcha InputBegan only supplies KeyCode. Poll its mouse API for clicks.
-local function updatePointer()
-	local x, y = mouse.X, mouse.Y
-	local active = type(isrbxactive) ~= "function" or isrbxactive()
-	local down = type(ismouse1pressed) == "function" and ismouse1pressed() or false
-	local valid = type(x) == "number" and type(y) == "number"
-	if not down or not active or not guiVisible then dragging = false end
-	pointerOverGui = active and guiVisible and GUI.ready and valid
-		and x >= GUI.x and x <= GUI.x + GUI.w and y >= GUI.y and y <= GUI.y + GUI.h
-	if pointerOverGui and down and not mouseWasDown and y < GUI.y + 58 then
-		dragging = true
-		dragX, dragY = x - GUI.x, y - GUI.y
-	end
-	if dragging and valid then
-		moveGui(x - dragX, y - dragY)
-		pointerOverGui = true
-	end
-	for _, b in ipairs(buttons) do
-		local hover = pointerOverGui and not dragging and x >= GUI.x + b.x and x <= GUI.x + b.x + b.w
-			and y >= GUI.y + b.y and y <= GUI.y + b.y + b.h
-		setDrawing(b.box, {Color = hover and Color3.fromRGB(40, 56, 71) or Color3.fromRGB(27, 35, 48)})
-		if hover and down and not mouseWasDown then b.action() end
-	end
-	mouseWasDown = down
+	local now = os.clock()
+	if now - lastUiUpdate < 0.15 then return end
+	lastUiUpdate = now
+	local mode = not CONFIG.enabled and "Disabled" or (menuOpen and "Paused while menu is open" or "Active")
+	local threat = currentThreat and string.format("Incoming: %.2fs", currentThreat.tti) or "Waiting for ball"
+	Status:SetContent(string.format("%s | %s\nPing: %d ms | Attempts: %d", mode, threat, math.floor(lastPing * 1000), parryCount))
 end
 
 local function safeAttribute(instance, name)
@@ -391,8 +315,6 @@ end
 
 local function update()
 	if not running then return end
-	updateKeys()
-	updatePointer()
 
 	local root = getRoot()
 	if not root then
@@ -407,7 +329,7 @@ local function update()
 	currentThreat = threat
 	lastPing = pingSeconds()
 	updateGui()
-	if not CONFIG.enabled or not threat or pointerOverGui then return end
+	if not CONFIG.enabled or not threat or menuOpen then return end
 
 	local pingLead = CONFIG.pingComp and lastPing * CONFIG.pingFactor or 0
 	local lead = math.min(CONFIG.maxLead, CONFIG.baseLead + pingLead)
@@ -452,11 +374,13 @@ renderConnection = renderSignal:Connect(update)
 _G.BB_MATCHA_STOP = function()
 	running = false
 	if renderConnection then renderConnection:Disconnect() end
-	for _, object in ipairs(drawings) do
-		pcall(function() object:Remove() end)
-	end
+	Library:Stop()
 	firedAt = {}
 	_G.BB_MATCHA_STOP = nil
 end
 
-print("Matcha local auto-parry loaded (T toggle, P show/hide GUI)")
+Library:OnUnload(function()
+	if running and _G.BB_MATCHA_STOP then _G.BB_MATCHA_STOP() end
+end)
+
+print("WabiSabi auto-parry loaded (P minimize/play, T toggle)")
