@@ -26,7 +26,11 @@ local CONFIG = {
 	pingFactor = 0.75,
 	maxLead = 0.42,
 	minInterval = 0.055,
-	sameBallRetry = 0.18,
+	clashInterval = 0.018,
+	clashRange = 22,
+	clashMinSpeed = 70,
+	clashRetry = 0.045,
+	maxClashRetries = 2,
 	fallback = true,
 }
 
@@ -35,7 +39,7 @@ local lastClick = 0
 local firedAt = {}
 local tracked = {}
 local renderConnection = nil
-local inputConnection = nil
+local keysHeld = {}
 local currentThreat = nil
 local lastPing = 0
 local parryCount = 0
@@ -189,6 +193,23 @@ local function updateGui()
 end
 
 buildGui()
+
+-- Matcha's native key polling uses Windows virtual-key numbers.
+local function updateKeys()
+	if type(iskeypressed) ~= "function" then return end
+	local active = type(isrbxactive) ~= "function" or isrbxactive()
+	for _, key in ipairs({80, 84}) do
+		local down = iskeypressed(key)
+		if active and down and not keysHeld[key] then
+			if key == 80 then guiVisible = not guiVisible
+			else
+				CONFIG.enabled = not CONFIG.enabled
+				print("Matcha auto-parry " .. (CONFIG.enabled and "enabled" or "disabled"))
+			end
+		end
+		keysHeld[key] = down
+	end
+end
 
 -- Matcha InputBegan only supplies KeyCode. Poll its mouse API for clicks.
 local function updatePointer()
@@ -353,10 +374,12 @@ local function chooseThreat(rootPosition)
 			state.seen = os.clock()
 			if state.target ~= ball.target then
 				firedAt[key] = nil
+				state.retries = 0
 				state.target = ball.target
 			end
 			if distance > 0.001 and ball.velocity:Dot(offset / distance) <= 0 then
 				firedAt[key] = nil
+				state.retries = 0
 			end
 
 			if distance > 0.001 and distance <= CONFIG.maxRange then
@@ -377,6 +400,7 @@ local function chooseThreat(rootPosition)
 							bestTime = impactTime
 							best = {
 								ball = ball,
+								distance = distance,
 								tti = impactTime,
 								aimed = aimed,
 							}
@@ -392,6 +416,7 @@ end
 
 local function update()
 	if not running then return end
+	updateKeys()
 	updatePointer()
 
 	local root = getRoot()
@@ -414,15 +439,24 @@ local function update()
 	if threat.tti > lead then return end
 
 	local now = os.clock()
-	if now - lastClick < CONFIG.minInterval then return end
+	local clash = threat.aimed and threat.distance <= CONFIG.clashRange
+		and threat.ball.speed >= CONFIG.clashMinSpeed
+	local interval = clash and CONFIG.clashInterval or CONFIG.minInterval
+	if now - lastClick < interval then return end
 
 	local key = ballKey(threat.ball)
 	local previous = firedAt[key]
-	-- One input per approach. Re-arm on a target change or outgoing motion.
-	if previous then return end
+	local state = tracked[key]
+	-- A complete close rebound can occur between replicated samples. Permit
+	-- bounded retries only for a fast, nearby ball still targeting this player.
+	if previous then
+		if not clash or now - previous < CONFIG.clashRetry
+			or (state.retries or 0) >= CONFIG.maxClashRetries then return end
+	end
 	if type(isrbxactive) == "function" and not isrbxactive() then return end
 
 	if fireParry() then
+		if previous then state.retries = (state.retries or 0) + 1 end
 		lastClick = now
 		firedAt[key] = now
 		parryCount = parryCount + 1
@@ -440,30 +474,9 @@ local renderSignal = RunService.RenderStepped or RunService.Heartbeat
 assert(renderSignal, "Matcha exposes neither RenderStepped nor Heartbeat")
 renderConnection = renderSignal:Connect(update)
 
-local UserInputService = game:GetService("UserInputService")
-local inputOk, inputSignal = pcall(function()
-	return UserInputService.InputBegan
-end)
-if inputOk and inputSignal then
-	inputConnection = inputSignal:Connect(function(input)
-		local ok, keyCode = pcall(function()
-			return input.KeyCode
-		end)
-		if ok and (keyCode == Enum.KeyCode.T or keyCode == 84) then
-			CONFIG.enabled = not CONFIG.enabled
-			print("Matcha auto-parry " .. (CONFIG.enabled and "enabled" or "disabled"))
-		elseif ok and (keyCode == Enum.KeyCode.P or keyCode == 80) then
-			guiVisible = not guiVisible
-			updateGui()
-		end
-
-	end)
-end
-
 _G.BB_MATCHA_STOP = function()
 	running = false
 	if renderConnection then renderConnection:Disconnect() end
-	if inputConnection then inputConnection:Disconnect() end
 	for _, object in ipairs(drawings) do
 		pcall(function() object:Remove() end)
 	end
