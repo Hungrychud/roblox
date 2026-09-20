@@ -1,270 +1,260 @@
----------------------------------
+-------------------------------------------------------------------------
+-- Blade Ball local auto-parry for Matcha
+-- T toggles the script. Re-executing replaces the previous copy.
+-------------------------------------------------------------------------
 
-local CollectionService = game:GetService("CollectionService")
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 
+local player = Players.LocalPlayer
+assert(player, "LocalPlayer is unavailable; run this as a client script")
+
+if _G.BB_MATCHA_STOP then
+	pcall(_G.BB_MATCHA_STOP)
+end
+
 local CONFIG = {
-	NpcTag = "ImpossibleParryNPC",
-	NpcAttribute = "ImpossibleParry",
-	BallsFolder = "Balls",
-	lookAhead = 1.5,
-	contact = 9,
-	targetedContact = 18,
-	minSpeed = 1,
-	retry = 0.04,
-	parryStateTime = 0.12,
+	enabled = true,
+	ballsFolder = "Balls",
+	minSpeed = 5,
+	maxRange = 140,
+	contactRadius = 4.5,
+	targetedRadius = 18,
+	baseLead = 0.12,
+	pingFactor = 0.75,
+	maxLead = 0.42,
+	minInterval = 0.055,
+	sameBallRetry = 0.18,
 	fallback = true,
-	fallbackRange = 500,
-	returnSpeedMultiplier = 1.10,
-	minimumReturnSpeed = 90,
-	aimLead = 0.10,
 }
 
-type BallState = {
-	container: Instance,
-	part: BasePart,
-	pos: Vector3,
-	vel: Vector3,
-	speed: number,
-	target: string?,
-}
+local running = true
+local lastClick = 0
+local firedAt = {}
+local renderConnection = nil
+local inputConnection = nil
 
-local npcs: {[Model]: boolean} = {}
-local firedBall: {[Model]: {[Instance]: number}} = setmetatable({}, { __mode = "k" }) :: any
-local parrySerial: {[Model]: number} = setmetatable({}, { __mode = "k" }) :: any
-local watchedNpcs: {[Model]: boolean} = setmetatable({}, { __mode = "k" }) :: any
-
-local function getRoot(model: Model): BasePart?
-	local root = model:FindFirstChild("HumanoidRootPart")
-	if root and root:IsA("BasePart") then return root end
-	return model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
-end
-
-local function isAliveNpc(model: Model): boolean
-	if Players:GetPlayerFromCharacter(model) then return false end
-	local humanoid = model:FindFirstChildOfClass("Humanoid")
-	return humanoid ~= nil and humanoid.Health > 0 and getRoot(model) ~= nil
-end
-
-local function registerNpc(instance: Instance)
-	-- Keep marked models in the registry even if their Humanoid/root has not
-	-- replicated yet. Heartbeat checks readiness before trying to parry.
-	if instance:IsA("Model") then npcs[instance] = true end
-end
-
-local function unregisterNpc(instance: Instance)
-	if instance:IsA("Model") then
-		npcs[instance] = nil
-		firedBall[instance] = nil
-	end
-end
-
-local function watchNpc(instance: Instance)
-	if not instance:IsA("Model") then return end
-	if watchedNpcs[instance] then return end
-	watchedNpcs[instance] = true
-	if instance:GetAttribute(CONFIG.NpcAttribute) == true then registerNpc(instance) end
-	-- Matcha does not implement GetAttributeChangedSignal. The initial value is
-	-- still honored there; full Roblox servers also receive later changes.
-	local hasSignal, attributeSignal = pcall(function()
-		return instance:GetAttributeChangedSignal(CONFIG.NpcAttribute)
+local function safeAttribute(instance, name)
+	local ok, value = pcall(function()
+		return instance:GetAttribute(name)
 	end)
-	if not hasSignal or not attributeSignal then return end
-	attributeSignal:Connect(function()
-		if instance:GetAttribute(CONFIG.NpcAttribute) == true then
-			registerNpc(instance)
-		elseif not CollectionService:HasTag(instance, CONFIG.NpcTag) then
-			unregisterNpc(instance)
-		end
-	end)
-end
-
-for _, instance in Workspace:GetDescendants() do watchNpc(instance) end
-for _, instance in CollectionService:GetTagged(CONFIG.NpcTag) do
-	watchNpc(instance)
-	registerNpc(instance)
-end
-local addedOk, tagAddedSignal = pcall(function()
-	return CollectionService:GetInstanceAddedSignal(CONFIG.NpcTag)
-end)
-if addedOk and tagAddedSignal then
-	tagAddedSignal:Connect(function(instance)
-		watchNpc(instance)
-		registerNpc(instance)
-	end)
-end
-
-local removedOk, tagRemovedSignal = pcall(function()
-	return CollectionService:GetInstanceRemovedSignal(CONFIG.NpcTag)
-end)
-if removedOk and tagRemovedSignal then
-	tagRemovedSignal:Connect(function(instance)
-		if instance:GetAttribute(CONFIG.NpcAttribute) ~= true then unregisterNpc(instance) end
-	end)
-end
-Workspace.DescendantAdded:Connect(function(instance)
-	watchNpc(instance)
-	-- A marked Model can be inserted before its Humanoid/root. Registering the
-	-- model itself above and retaining it in `npcs` makes that order harmless.
-end)
-Workspace.DescendantRemoving:Connect(unregisterNpc)
-
-local function getBallState(container: Instance): BallState?
-	if container:GetAttribute("realBall") == false then return nil end
-	local part: BasePart?
-	if container:IsA("BasePart") then
-		part = container
-	elseif container:IsA("Model") then
-		part = container.PrimaryPart or container:FindFirstChildWhichIsA("BasePart", true)
-	end
-	if not part then return nil end
-	local velocity = part.AssemblyLinearVelocity
-	local speed = velocity.Magnitude
-	if speed < CONFIG.minSpeed then return nil end
-	local target = container:GetAttribute("target") or container:GetAttribute("Target")
-	if target == nil and container ~= part then
-		target = part:GetAttribute("target") or part:GetAttribute("Target")
-	end
-	return {
-		container = container,
-		part = part,
-		pos = part.Position,
-		vel = velocity,
-		speed = speed,
-		target = if type(target) == "string" then target else nil,
-	}
-end
-
--- Keeps the original realBall/target priority and incoming-ball fallback, but
--- uses closest-point prediction so high-speed balls cannot tunnel past an NPC.
-local function getThreat(ball: BallState, npc: Model, root: BasePart): number?
-	local toNpc = root.Position - ball.pos
-	local distance = toNpc.Magnitude
-	if distance < 0.001 then return 0 end
-	if ball.vel:Dot(toNpc / distance) <= 0 then return nil end
-	local tti = math.clamp(toNpc:Dot(ball.vel) / (ball.speed * ball.speed), 0, CONFIG.lookAhead)
-	local miss = (root.Position - (ball.pos + ball.vel * tti)).Magnitude
-	if ball.target == npc.Name and miss <= CONFIG.targetedContact then return tti end
-	if CONFIG.fallback and distance <= CONFIG.fallbackRange and miss <= CONFIG.contact then return tti end
+	if ok then return value end
 	return nil
 end
 
-local function findReturnTarget(npc: Model, origin: Vector3): (BasePart?, string?)
-	local bestRoot: BasePart? = nil
-	local bestName: string? = nil
-	local bestDistance = math.huge
-	for _, player in Players:GetPlayers() do
-		local character = player.Character
-		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-		local root = character and getRoot(character)
-		if humanoid and humanoid.Health > 0 and root then
-			local distance = (root.Position - origin).Magnitude
-			if distance < bestDistance then
-				bestRoot, bestName, bestDistance = root, player.Name, distance
-			end
-		end
+local function getRoot()
+	local character = player.Character
+	if not character then return nil end
+
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if not root then return nil end
+
+	local alive = Workspace:FindFirstChild("Alive")
+	if alive and character.Parent ~= alive then return nil end
+	if safeAttribute(character, "Stunned") or safeAttribute(character, "PULSED") then
+		return nil
 	end
-	for otherNpc in npcs do
-		if otherNpc ~= npc and isAliveNpc(otherNpc) then
-			local root = getRoot(otherNpc)
-			if root then
-				local distance = (root.Position - origin).Magnitude
-				if distance < bestDistance then
-					bestRoot, bestName, bestDistance = root, otherNpc.Name, distance
+
+	return root
+end
+
+local function getBallPart(object)
+	local ok, isPart = pcall(function()
+		return object:IsA("BasePart")
+	end)
+	if ok and isPart then return object end
+
+	local modelOk, isModel = pcall(function()
+		return object:IsA("Model")
+	end)
+	if modelOk and isModel then
+		local primaryOk, primary = pcall(function()
+			return object.PrimaryPart
+		end)
+		if primaryOk and primary then return primary end
+
+		local findOk, part = pcall(function()
+			return object:FindFirstChildWhichIsA("BasePart", true)
+		end)
+		if findOk then return part end
+	end
+
+	return nil
+end
+
+local function readBall(object)
+	local part = getBallPart(object)
+	if not part then return nil end
+
+	local positionOk, position = pcall(function()
+		return part.Position
+	end)
+	local velocityOk, velocity = pcall(function()
+		return part.AssemblyLinearVelocity
+	end)
+	if not velocityOk or not velocity then
+		velocityOk, velocity = pcall(function()
+			return part.Velocity
+		end)
+	end
+	if not positionOk or not velocityOk or not position or not velocity then
+		return nil
+	end
+
+	local speed = velocity.Magnitude
+	if speed < CONFIG.minSpeed then return nil end
+
+	local realBall = safeAttribute(object, "realBall")
+	if realBall == nil and object ~= part then
+		realBall = safeAttribute(part, "realBall")
+	end
+	if realBall == false then return nil end
+
+	local target = safeAttribute(object, "target") or safeAttribute(object, "Target")
+	if target == nil and object ~= part then
+		target = safeAttribute(part, "target") or safeAttribute(part, "Target")
+	end
+
+	return {
+		object = object,
+		part = part,
+		position = position,
+		velocity = velocity,
+		speed = speed,
+		target = target,
+		real = realBall,
+	}
+end
+
+local function ballKey(ball)
+	local ok, address = pcall(function()
+		return ball.object.Address
+	end)
+	if ok and address ~= nil then return address end
+	return ball.object
+end
+
+local function pingSeconds()
+	if type(GetPingValue) ~= "function" then return 0 end
+	local ok, value = pcall(GetPingValue)
+	if not ok or type(value) ~= "number" then return 0 end
+	return math.clamp(value, 0, 400) / 1000
+end
+
+local function fireParry()
+	local click = mouse1click
+	if type(click) ~= "function" then
+		click = mouse2click
+	end
+	if type(click) ~= "function" then
+		warn("Matcha does not expose mouse1click or mouse2click")
+		return false
+	end
+	return pcall(click)
+end
+
+local function chooseThreat(rootPosition)
+	local folder = Workspace:FindFirstChild(CONFIG.ballsFolder)
+	if not folder then return nil end
+
+	local best = nil
+	local bestTime = math.huge
+
+	for _, object in ipairs(folder:GetChildren()) do
+		local ball = readBall(object)
+		if ball then
+			local offset = rootPosition - ball.position
+			local distance = offset.Magnitude
+
+			if distance > 0.001 and distance <= CONFIG.maxRange then
+				local closing = ball.velocity:Dot(offset / distance)
+
+				if closing > 0 then
+					local closestTime = math.max(0, offset:Dot(ball.velocity) / (ball.speed * ball.speed))
+					local closestPoint = ball.position + ball.velocity * closestTime
+					local missDistance = (rootPosition - closestPoint).Magnitude
+					local aimed = ball.target == player.Name
+					local allowedMiss = aimed and CONFIG.targetedRadius or CONFIG.contactRadius
+					local eligible = (ball.real == true and aimed)
+						or (CONFIG.fallback and ball.real ~= false)
+
+					if eligible and missDistance <= allowedMiss then
+						local impactTime = math.max(0, (distance - CONFIG.contactRadius) / closing)
+						if impactTime < bestTime then
+							bestTime = impactTime
+							best = {
+								ball = ball,
+								tti = impactTime,
+								aimed = aimed,
+							}
+						end
+					end
 				end
 			end
 		end
 	end
-	return bestRoot, bestName
+
+	return best
 end
 
-local function setBallTarget(ball: BallState, name: string)
-	ball.container:SetAttribute("target", name)
-	if ball.container:GetAttribute("Target") ~= nil then ball.container:SetAttribute("Target", name) end
-	if ball.container ~= ball.part then
-		if ball.part:GetAttribute("target") ~= nil then ball.part:SetAttribute("target", name) end
-		if ball.part:GetAttribute("Target") ~= nil then ball.part:SetAttribute("Target", name) end
-	end
-end
+local function update()
+	if not running or not CONFIG.enabled then return end
 
-local function parry(npc: Model, root: BasePart, ball: BallState)
+	local root = getRoot()
+	if not root then return end
+
+	local threat = chooseThreat(root.Position)
+	if not threat then return end
+
+	local lead = math.min(CONFIG.maxLead, CONFIG.baseLead + pingSeconds() * CONFIG.pingFactor)
+	if threat.tti > lead then return end
+
 	local now = os.clock()
-	local history = firedBall[npc]
-	if not history then
-		history = setmetatable({}, { __mode = "k" }) :: any
-		firedBall[npc] = history
-	end
-	if now - (history[ball.container] or -math.huge) < CONFIG.retry then return end
-	history[ball.container] = now
+	if now - lastClick < CONFIG.minInterval then return end
 
-	local returnRoot, returnName = findReturnTarget(npc, ball.pos)
-	local direction: Vector3
-	if returnRoot and returnName then
-		direction = returnRoot.Position + returnRoot.AssemblyLinearVelocity * CONFIG.aimLead - ball.pos
-		setBallTarget(ball, returnName)
-	else
-		local normal = ball.pos - root.Position
-		if normal.Magnitude < 0.001 then
-			direction = -ball.vel
-		else
-			normal = normal.Unit
-			direction = ball.vel - 2 * ball.vel:Dot(normal) * normal
+	local key = ballKey(threat.ball)
+	local previous = firedAt[key]
+	if previous and now - previous < CONFIG.sameBallRetry then return end
+
+	if fireParry() then
+		lastClick = now
+		firedAt[key] = now
+	end
+
+	for oldKey, timestamp in pairs(firedAt) do
+		if now - timestamp > 2 then
+			firedAt[oldKey] = nil
 		end
 	end
-	if direction.Magnitude < 0.001 then direction = -ball.vel end
+end
 
-	-- Server ownership makes the hardest NPC independent of client ping.
-	pcall(function() ball.part:SetNetworkOwner(nil) end)
-	local speed = math.max(ball.speed * CONFIG.returnSpeedMultiplier, CONFIG.minimumReturnSpeed)
-	ball.part.AssemblyLinearVelocity = direction.Unit * speed
-	ball.container:SetAttribute("Parried", true)
-	ball.container:SetAttribute("LastParriedBy", npc.Name)
-	npc:SetAttribute("Parrying", true)
+local renderSignal = RunService.RenderStepped or RunService.Heartbeat
+assert(renderSignal, "Matcha exposes neither RenderStepped nor Heartbeat")
+renderConnection = renderSignal:Connect(update)
 
-	-- Existing server VFX/animation/counter code can listen to this event.
-	local event = npc:FindFirstChild("ImpossibleParry")
-	if event and not event:IsA("BindableEvent") then
-		warn(("%s.ImpossibleParry must be a BindableEvent"):format(npc:GetFullName()))
-		event = nil
-	elseif not event then
-		event = Instance.new("BindableEvent")
-		event.Name = "ImpossibleParry"
-		event.Parent = npc
-	end
-	if event then (event :: BindableEvent):Fire(ball.container) end
-
-	local serial = (parrySerial[npc] or 0) + 1
-	parrySerial[npc] = serial
-	task.delay(CONFIG.parryStateTime, function()
-		if npc.Parent and parrySerial[npc] == serial then npc:SetAttribute("Parrying", false) end
+local UserInputService = game:GetService("UserInputService")
+local inputOk, inputSignal = pcall(function()
+	return UserInputService.InputBegan
+end)
+if inputOk and inputSignal then
+	inputConnection = inputSignal:Connect(function(input)
+		local ok, keyCode = pcall(function()
+			return input.KeyCode
+		end)
+		if ok and keyCode == Enum.KeyCode.T then
+			CONFIG.enabled = not CONFIG.enabled
+			print("Matcha auto-parry " .. (CONFIG.enabled and "enabled" or "disabled"))
+		end
 	end)
 end
 
-RunService.Heartbeat:Connect(function()
-	local folder = Workspace:FindFirstChild(CONFIG.BallsFolder)
-	if not folder then return end
-	for _, child in folder:GetChildren() do
-		local ball = getBallState(child)
-		if not ball then continue end
-		local bestNpc: Model? = nil
-		local bestRoot: BasePart? = nil
-		local bestTti = math.huge
-		for npc in npcs do
-			if not npc:IsDescendantOf(Workspace) then
-				unregisterNpc(npc)
-				continue
-			end
-			if not isAliveNpc(npc) then continue end
-			local root = getRoot(npc)
-			if root then
-				local tti = getThreat(ball, npc, root)
-				if tti ~= nil and tti < bestTti then
-					bestNpc, bestRoot, bestTti = npc, root, tti
-				end
-			end
-		end
-		if bestNpc and bestRoot then parry(bestNpc, bestRoot, ball) end
-	end
-end)
+_G.BB_MATCHA_STOP = function()
+	running = false
+	if renderConnection then renderConnection:Disconnect() end
+	if inputConnection then inputConnection:Disconnect() end
+	firedAt = {}
+	_G.BB_MATCHA_STOP = nil
+end
+
+print("Matcha local auto-parry loaded (T to toggle)")
