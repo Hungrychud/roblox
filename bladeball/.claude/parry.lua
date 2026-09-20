@@ -51,11 +51,67 @@ local fetched, source = pcall(function()
 	return game:HttpGet("https://scripts.wabisabi.mom/wabi-sabi-ui-lib.lua")
 end)
 assert(fetched and type(source) == "string", "Could not download WabiSabi UI")
+-- Extend WabiSabi's own renderer so help follows dragging, scrolling and tabs.
+-- Plain, checked anchors avoid silently patching an incompatible library release.
+local function extendUi(anchor, replacement)
+	local first, last = source:find(anchor, 1, true)
+	assert(first and not source:find(anchor, last + 1, true), "WabiSabi help integration needs updating")
+	source = source:sub(1, first - 1) .. replacement .. source:sub(last + 1)
+end
+local titleAnchor = '    text(idp .. ".t", el.title, titleX, titleY, 13, Theme.Text, z + 2)'
+extendUi(titleAnchor, [=[
+    local help = UI.HelpText and UI.HelpText[el.title]
+    if help then
+        local hx, hy = titleX + 6, titleY + 7
+        local helpHover = inBounds(hx - 9, hy - 9, 18, 18)
+            and not State.Overlay and not State.Dialog and not State.Drag
+        circle(idp .. ".help.bg", hx, hy, 7, helpHover and Theme.Accent or Theme.Control, 1, z + 3)
+        text(idp .. ".help.q", "?", hx, titleY, 12, Theme.Text, z + 4, true)
+        titleX = titleX + 22
+        if helpHover then
+            UI._hoverHelp = help
+            hovered = false
+        end
+    end
+]=] .. titleAnchor)
+extendUi('    if State.Minimized then renderBubble(dt) else renderWindow(dt) end',
+	'    UI._hoverHelp = nil\n    if State.Minimized then renderBubble(dt) else renderWindow(dt) end')
+extendUi('    renderNotifs(dt)\n    cleanup()', [=[
+    renderNotifs(dt)
+    if UI._hoverHelp and not State.Minimized then
+        local vw, vh = getViewport()
+        local width = math.min(280, vw - 16)
+        local lines = wrapText(UI._hoverHelp, 12, width - 24)
+        local height = #lines * 16 + 20
+        local tx = clamp(Input.mx + 16, 8, math.max(8, vw - width - 8))
+        local ty = Input.my + 22
+        if ty + height > vh - 8 then ty = Input.my - height - 12 end
+        ty = math.max(8, ty)
+        rect("help.tooltip.bg", tx, ty, width, height, Theme.OverlayBg, 1, 300, 6)
+        outline("help.tooltip.border", tx, ty, width, height, Theme.Accent, 0.8, 301, 6)
+        for i, ln in ipairs(lines) do
+            text("help.tooltip.line" .. i, ln, tx + 12, ty + 10 + (i - 1) * 16, 12, Theme.Text, 302)
+        end
+    end
+    cleanup()
+]=])
 local uiChunk, compileError = loadstring(source)
 assert(uiChunk, "Could not compile WabiSabi: " .. tostring(compileError))
 local loadedLibrary = uiChunk()
 local Library = WabiSabi or loadedLibrary
 assert(type(Library) == "table" and type(Library.CreateWindow) == "function", "Invalid WabiSabi UI")
+Library.HelpText = {
+	["Auto parry"] = "Automatically clicks when an incoming real ball reaches your parry timing window. T toggles it. Minimize with P to play.",
+	["Close-range retries"] = "Allows up to two extra attempts during fast, nearby exchanges if a rebound was missed between updates.",
+	["Fallback targeting"] = "Considers incoming real balls with an unknown target. Balls assigned to another player are still ignored.",
+	["Ping compensation"] = "Adds part of your measured network delay to the timing lead, so inputs are sent earlier when latency rises.",
+	["Reaction lead (ms)"] = "How early to click before predicted contact. Higher values click earlier; too high can waste the parry window.",
+	["Detection range (studs)"] = "Maximum distance at which balls are considered. Increasing this does not increase the game's actual parry range.",
+	["Close-range distance (studs)"] = "Distance within which fast incoming balls may use the shorter cooldown and bounded retries. Requires close-range retries enabled.",
+	["Theme"] = "Changes the window colors. It does not change auto-parry behavior.",
+	["Minimize and play"] = "Collapses the menu into a small bubble and lets auto-parry run when enabled. Press P or click the bubble to restore it.",
+	["Unload script"] = "Stops auto-parry and removes this UI. Run the loader again to restart.",
+}
 
 local Window = Library:CreateWindow({
 	Title = "Matcha",
