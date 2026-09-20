@@ -26,6 +26,7 @@ local CONFIG = {
 	pingFactor = 0.75,
 	maxLead = 0.42,
 	minInterval = 0.055,
+	clashEnabled = true,
 	clashInterval = 0.018,
 	clashRange = 22,
 	clashMinSpeed = 70,
@@ -53,146 +54,116 @@ local pointerOverGui = false
 -------------------------------------------------------------------------
 -- Matcha Drawing GUI
 -------------------------------------------------------------------------
-local GUI = {
-	x = 20,
-	y = 100,
-	w = 270,
-	row = 29,
-	background = nil,
-	title = nil,
-	status = nil,
-	ready = false,
-}
+local GUI = {x = 30, y = 100, w = 320, h = 374, ready = false}
+local layout = {}
+local dragging = false
+local dragX, dragY = 0, 0
+local accent = Color3.fromRGB(104, 220, 190)
+local muted = Color3.fromRGB(143, 156, 175)
 
 local function setDrawing(object, properties)
 	if not object then return end
-	for key, value in pairs(properties) do
-		pcall(function() object[key] = value end)
-	end
+	for key, value in pairs(properties) do pcall(function() object[key] = value end) end
 end
 
-local function newDrawing(kind, properties)
-	if Drawing == nil or type(Drawing.new) ~= "function" then return nil end
+local function draw(kind, x, y, properties)
+	if Drawing == nil then return nil end
 	local ok, object = pcall(function() return Drawing.new(kind) end)
 	if not ok or not object then return nil end
 	drawings[#drawings + 1] = object
+	layout[#layout + 1] = {object = object, x = x, y = y}
+	properties.Position = Vector2.new(GUI.x + x, GUI.y + y)
+	properties.Visible = true
+	properties.Transparency = properties.Transparency or 0
 	setDrawing(object, properties)
 	return object
 end
 
-local function addButton(y, xOffset, width, label, action)
-	local button = {
-		x = GUI.x + xOffset,
-		y = y,
-		w = width,
-		h = 24,
-		label = label,
-		action = action,
-	}
-	button.box = newDrawing("Square", {
-		Position = Vector2.new(button.x, button.y),
-		Size = Vector2.new(button.w, button.h),
-		Filled = true,
-		Color = Color3.fromRGB(34, 39, 52),
-		Transparency = 0.05,
-		Thickness = 1,
-		Visible = true,
-	})
-	button.text = newDrawing("Text", {
-		Position = Vector2.new(button.x + 8, button.y + 5),
-		Size = 14,
-		Font = 2,
-		Outline = true,
-		Color = Color3.fromRGB(225, 230, 240),
-		Visible = true,
-	})
-	buttons[#buttons + 1] = button
+local function rect(x, y, w, h, color, z)
+	return draw("Square", x, y, {Size = Vector2.new(w, h), Filled = true,
+		Color = color, Rounding = 8, ZIndex = z or 2})
 end
 
-local function buildGui()
-	GUI.background = newDrawing("Square", {
-		Position = Vector2.new(GUI.x, GUI.y),
-		Size = Vector2.new(GUI.w, 235),
-		Filled = true,
-		Color = Color3.fromRGB(15, 18, 27),
-		Transparency = 0.06,
-		Thickness = 1,
-		Visible = true,
-	})
-	GUI.title = newDrawing("Text", {
-		Position = Vector2.new(GUI.x + 10, GUI.y + 9),
-		Text = "MATCHA AUTO PARRY",
-		Size = 17,
-		Font = 2,
-		Outline = true,
-		Color = Color3.fromRGB(100, 210, 255),
-		Visible = true,
-	})
-	GUI.status = newDrawing("Text", {
-		Position = Vector2.new(GUI.x + 10, GUI.y + 34),
-		Size = 13,
-		Font = 2,
-		Outline = true,
-		Color = Color3.fromRGB(180, 190, 205),
-		Visible = true,
-	})
-
-	local y = GUI.y + 61
-	addButton(y, 8, GUI.w - 16, function()
-		return "Auto parry: " .. (CONFIG.enabled and "ON" or "OFF") .. "  [T]"
-	end, function() CONFIG.enabled = not CONFIG.enabled end)
-	y = y + GUI.row
-	addButton(y, 8, GUI.w - 16, function()
-		return "Fallback targeting: " .. (CONFIG.fallback and "ON" or "OFF")
-	end, function() CONFIG.fallback = not CONFIG.fallback end)
-	y = y + GUI.row
-	addButton(y, 8, GUI.w - 16, function()
-		return "Ping compensation: " .. (CONFIG.pingComp and "ON" or "OFF")
-	end, function() CONFIG.pingComp = not CONFIG.pingComp end)
-	y = y + GUI.row
-	addButton(y, 8, 124, function()
-		return "Lead -  (" .. math.floor(CONFIG.baseLead * 1000) .. "ms)"
-	end, function() CONFIG.baseLead = math.max(0.02, CONFIG.baseLead - 0.01) end)
-	addButton(y, 138, 124, function() return "Lead +" end,
-		function() CONFIG.baseLead = math.min(CONFIG.maxLead, CONFIG.baseLead + 0.01) end)
-	y = y + GUI.row
-	addButton(y, 8, 124, function()
-		return "Range -  (" .. math.floor(CONFIG.maxRange) .. ")"
-	end, function() CONFIG.maxRange = math.max(30, CONFIG.maxRange - 10) end)
-	addButton(y, 138, 124, function() return "Range +" end,
-		function() CONFIG.maxRange = math.min(300, CONFIG.maxRange + 10) end)
-
-	GUI.ready = GUI.background ~= nil and GUI.title ~= nil and GUI.status ~= nil
+local function label(x, y, text, size, color)
+	return draw("Text", x, y, {Text = text, Size = size or 14, Font = 2,
+		Color = color or Color3.fromRGB(229, 236, 244), ZIndex = 5})
 end
+
+local function moveGui(x, y)
+	local camera = Workspace.CurrentCamera
+	local viewport = camera and camera.ViewportSize
+	if viewport then
+		x = math.clamp(x, 0, math.max(0, viewport.X - GUI.w))
+		y = math.clamp(y, 0, math.max(0, viewport.Y - GUI.h))
+	end
+	GUI.x, GUI.y = x, y
+	for _, item in ipairs(layout) do
+		setDrawing(item.object, {Position = Vector2.new(x + item.x, y + item.y)})
+	end
+end
+
+local function toggle(y, title, key)
+	local b = {x = 12, y = y, w = 296, h = 36, key = key}
+	b.box = rect(b.x, b.y, b.w, b.h, Color3.fromRGB(27, 35, 48))
+	label(24, y + 10, title)
+	b.track = rect(252, y + 8, 44, 20, muted, 3)
+	b.knob = rect(255, y + 11, 14, 14, Color3.fromRGB(241, 248, 250), 4)
+	b.knobLayout = layout[#layout]
+	b.action = function() CONFIG[key] = not CONFIG[key] end
+	buttons[#buttons + 1] = b
+end
+
+local function stepper(y, title, key, step, low, high, scale, suffix)
+	local value = label(24, y + 10, "", 14)
+	for _, direction in ipairs({-1, 1}) do
+		local x = direction == -1 and 238 or 274
+		local b = {x = x, y = y, w = 30, h = 30}
+		b.box = rect(x, y, 30, 30, Color3.fromRGB(35, 47, 62))
+		label(x + 10, y + 6, direction == -1 and "-" or "+", 17, accent)
+		b.action = function() CONFIG[key] = math.clamp(CONFIG[key] + direction * step, low, high) end
+		buttons[#buttons + 1] = b
+	end
+	return function()
+		setDrawing(value, {Text = title .. "   " .. math.floor(CONFIG[key] * scale + 0.5) .. suffix})
+	end
+end
+
+rect(4, 5, GUI.w, GUI.h, Color3.fromRGB(7, 10, 16), 0)
+GUI.background = rect(0, 0, GUI.w, GUI.h, Color3.fromRGB(17, 23, 33), 1)
+rect(0, 0, GUI.w, 3, accent, 3)
+GUI.title = label(18, 14, "MATCHA  /  PARRY", 18, accent)
+label(18, 39, "Drag header to move", 12, muted)
+GUI.badge = label(250, 17, "ACTIVE", 12, accent)
+rect(12, 62, 296, 48, Color3.fromRGB(23, 31, 43))
+GUI.status = label(24, 69, "Waiting for ball", 13, muted)
+toggle(120, "Auto parry  [T]", "enabled")
+toggle(160, "Close-range retries", "clashEnabled")
+toggle(200, "Fallback targeting", "fallback")
+toggle(240, "Ping compensation", "pingComp")
+local refreshLead = stepper(284, "Reaction", "baseLead", 0.01, 0.02, CONFIG.maxLead, 1000, " ms")
+local refreshRange = stepper(320, "Range", "maxRange", 10, 30, 300, 1, " studs")
+label(18, 356, "P  show / hide     T  auto parry", 11, muted)
+GUI.ready = GUI.background ~= nil
 
 local function updateGui()
 	if not GUI.ready then return end
-	for _, object in ipairs(drawings) do
-		pcall(function() object.Visible = guiVisible end)
-	end
+	for _, object in ipairs(drawings) do setDrawing(object, {Visible = guiVisible}) end
 	if not guiVisible then return end
-
-	local stateColor = CONFIG.enabled and Color3.fromRGB(100, 235, 145)
-		or Color3.fromRGB(255, 105, 105)
-	setDrawing(GUI.title, {Color = stateColor})
-
-	local threatText = "no incoming ball"
-	if currentThreat then
-		threatText = string.format("ball %.2fs | %s", currentThreat.tti,
-			currentThreat.aimed and "TARGETED" or "fallback")
+	setDrawing(GUI.badge, {Text = CONFIG.enabled and "ACTIVE" or "PAUSED",
+		Color = CONFIG.enabled and accent or muted})
+	local status = currentThreat and string.format("Incoming %.2fs", currentThreat.tti) or "Waiting for ball"
+	setDrawing(GUI.status, {Text = string.format("%s\n%d ms ping   /   %d attempts", status, math.floor(lastPing * 1000), parryCount)})
+	for _, b in ipairs(buttons) do
+		if b.key then
+			local enabled = CONFIG[b.key]
+			setDrawing(b.track, {Color = enabled and accent or Color3.fromRGB(65, 76, 93)})
+			b.knobLayout.x = enabled and 279 or 255
+			setDrawing(b.knob, {Position = Vector2.new(GUI.x + b.knobLayout.x, GUI.y + b.knobLayout.y)})
+		end
 	end
-	setDrawing(GUI.status, {
-		Text = string.format("%s\nping %dms | attempts %d", threatText,
-			math.floor(lastPing * 1000), parryCount),
-	})
-
-	for _, button in ipairs(buttons) do
-		local text = type(button.label) == "function" and button.label() or button.label
-		setDrawing(button.text, {Text = text})
-	end
+	refreshLead()
+	refreshRange()
 end
-
-buildGui()
 
 -- Matcha's native key polling uses Windows virtual-key numbers.
 local function updateKeys()
@@ -215,20 +186,24 @@ end
 local function updatePointer()
 	local x, y = mouse.X, mouse.Y
 	local active = type(isrbxactive) ~= "function" or isrbxactive()
-	pointerOverGui = active and guiVisible and GUI.ready and type(x) == "number" and type(y) == "number"
-		and x >= GUI.x and x <= GUI.x + GUI.w and y >= GUI.y and y <= GUI.y + 235
 	local down = type(ismouse1pressed) == "function" and ismouse1pressed() or false
-	if pointerOverGui then
-		for _, button in ipairs(buttons) do
-			local hover = x >= button.x and x <= button.x + button.w
-				and y >= button.y and y <= button.y + button.h
-			setDrawing(button.box, {Color = hover and Color3.fromRGB(55, 78, 100) or Color3.fromRGB(34, 39, 52)})
-			if hover and down and not mouseWasDown then button.action() end
-		end
-	else
-		for _, button in ipairs(buttons) do
-			setDrawing(button.box, {Color = Color3.fromRGB(34, 39, 52)})
-		end
+	local valid = type(x) == "number" and type(y) == "number"
+	if not down or not active or not guiVisible then dragging = false end
+	pointerOverGui = active and guiVisible and GUI.ready and valid
+		and x >= GUI.x and x <= GUI.x + GUI.w and y >= GUI.y and y <= GUI.y + GUI.h
+	if pointerOverGui and down and not mouseWasDown and y < GUI.y + 58 then
+		dragging = true
+		dragX, dragY = x - GUI.x, y - GUI.y
+	end
+	if dragging and valid then
+		moveGui(x - dragX, y - dragY)
+		pointerOverGui = true
+	end
+	for _, b in ipairs(buttons) do
+		local hover = pointerOverGui and not dragging and x >= GUI.x + b.x and x <= GUI.x + b.x + b.w
+			and y >= GUI.y + b.y and y <= GUI.y + b.y + b.h
+		setDrawing(b.box, {Color = hover and Color3.fromRGB(40, 56, 71) or Color3.fromRGB(27, 35, 48)})
+		if hover and down and not mouseWasDown then b.action() end
 	end
 	mouseWasDown = down
 end
@@ -439,7 +414,7 @@ local function update()
 	if threat.tti > lead then return end
 
 	local now = os.clock()
-	local clash = threat.aimed and threat.distance <= CONFIG.clashRange
+	local clash = CONFIG.clashEnabled and threat.aimed and threat.distance <= CONFIG.clashRange
 		and threat.ball.speed >= CONFIG.clashMinSpeed
 	local interval = clash and CONFIG.clashInterval or CONFIG.minInterval
 	if now - lastClick < interval then return end
