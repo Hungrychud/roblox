@@ -66,7 +66,13 @@ local function watchNpc(instance: Instance)
 	if watchedNpcs[instance] then return end
 	watchedNpcs[instance] = true
 	if instance:GetAttribute(CONFIG.NpcAttribute) == true then registerNpc(instance) end
-	instance:GetAttributeChangedSignal(CONFIG.NpcAttribute):Connect(function()
+	-- Matcha does not implement GetAttributeChangedSignal. The initial value is
+	-- still honored there; full Roblox servers also receive later changes.
+	local hasSignal, attributeSignal = pcall(function()
+		return instance:GetAttributeChangedSignal(CONFIG.NpcAttribute)
+	end)
+	if not hasSignal or not attributeSignal then return end
+	attributeSignal:Connect(function()
 		if instance:GetAttribute(CONFIG.NpcAttribute) == true then
 			registerNpc(instance)
 		elseif not CollectionService:HasTag(instance, CONFIG.NpcTag) then
@@ -80,13 +86,24 @@ for _, instance in CollectionService:GetTagged(CONFIG.NpcTag) do
 	watchNpc(instance)
 	registerNpc(instance)
 end
-CollectionService:GetInstanceAddedSignal(CONFIG.NpcTag):Connect(function(instance)
-	watchNpc(instance)
-	registerNpc(instance)
+local addedOk, tagAddedSignal = pcall(function()
+	return CollectionService:GetInstanceAddedSignal(CONFIG.NpcTag)
 end)
-CollectionService:GetInstanceRemovedSignal(CONFIG.NpcTag):Connect(function(instance)
-	if instance:GetAttribute(CONFIG.NpcAttribute) ~= true then unregisterNpc(instance) end
+if addedOk and tagAddedSignal then
+	tagAddedSignal:Connect(function(instance)
+		watchNpc(instance)
+		registerNpc(instance)
+	end)
+end
+
+local removedOk, tagRemovedSignal = pcall(function()
+	return CollectionService:GetInstanceRemovedSignal(CONFIG.NpcTag)
 end)
+if removedOk and tagRemovedSignal then
+	tagRemovedSignal:Connect(function(instance)
+		if instance:GetAttribute(CONFIG.NpcAttribute) ~= true then unregisterNpc(instance) end
+	end)
+end
 Workspace.DescendantAdded:Connect(function(instance)
 	watchNpc(instance)
 	-- A marked Model can be inserted before its Humanoid/root. Registering the
