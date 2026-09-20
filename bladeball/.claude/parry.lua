@@ -33,6 +33,7 @@ local CONFIG = {
 local running = true
 local lastClick = 0
 local firedAt = {}
+local tracked = {}
 local renderConnection = nil
 local inputConnection = nil
 local currentThreat = nil
@@ -86,7 +87,7 @@ local function addButton(y, xOffset, width, label, action)
 		Size = Vector2.new(button.w, button.h),
 		Filled = true,
 		Color = Color3.fromRGB(34, 39, 52),
-		Transparency = 0.95,
+		Transparency = 0.05,
 		Thickness = 1,
 		Visible = true,
 	})
@@ -107,7 +108,7 @@ local function buildGui()
 		Size = Vector2.new(GUI.w, 235),
 		Filled = true,
 		Color = Color3.fromRGB(15, 18, 27),
-		Transparency = 0.94,
+		Transparency = 0.06,
 		Thickness = 1,
 		Visible = true,
 	})
@@ -174,7 +175,7 @@ local function updateGui()
 			currentThreat.aimed and "TARGETED" or "fallback")
 	end
 	setDrawing(GUI.status, {
-		Text = string.format("%s | ping %dms | parries %d", threatText,
+		Text = string.format("%s\nping %dms | attempts %d", threatText,
 			math.floor(lastPing * 1000), parryCount),
 	})
 
@@ -202,7 +203,10 @@ local function getRoot()
 	if not root then return nil end
 
 	local alive = Workspace:FindFirstChild("Alive")
-	if alive and character.Parent ~= alive then return nil end
+	local parent = character.Parent
+	if alive and (not parent or parent.Address ~= alive.Address) then return nil end
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if humanoid and humanoid.Health <= 0 then return nil end
 	if safeAttribute(character, "Stunned") or safeAttribute(character, "PULSED") then
 		return nil
 	end
@@ -212,12 +216,12 @@ end
 
 local function getBallPart(object)
 	local ok, isPart = pcall(function()
-		return object:IsA("BasePart")
+		return object.ClassName == "Part" or object.ClassName == "MeshPart" or object.ClassName == "UnionOperation"
 	end)
 	if ok and isPart then return object end
 
 	local modelOk, isModel = pcall(function()
-		return object:IsA("Model")
+		return object.ClassName == "Model"
 	end)
 	if modelOk and isModel then
 		local primaryOk, primary = pcall(function()
@@ -302,7 +306,8 @@ local function fireParry()
 		warn("Matcha does not expose mouse1click or mouse2click")
 		return false
 	end
-	return pcall(click)
+	local ok, result = pcall(click)
+	return ok and result ~= false
 end
 
 local function chooseThreat(rootPosition)
@@ -317,6 +322,17 @@ local function chooseThreat(rootPosition)
 		if ball then
 			local offset = rootPosition - ball.position
 			local distance = offset.Magnitude
+			local key = ballKey(ball)
+			local state = tracked[key]
+			if not state then state = {}; tracked[key] = state end
+			state.seen = os.clock()
+			if state.target ~= ball.target then
+				firedAt[key] = nil
+				state.target = ball.target
+			end
+			if distance > 0.001 and ball.velocity:Dot(offset / distance) <= 0 then
+				firedAt[key] = nil
+			end
 
 			if distance > 0.001 and distance <= CONFIG.maxRange then
 				local closing = ball.velocity:Dot(offset / distance)
@@ -327,12 +343,12 @@ local function chooseThreat(rootPosition)
 					local missDistance = (rootPosition - closestPoint).Magnitude
 					local aimed = ball.target == player.Name
 					local allowedMiss = aimed and CONFIG.targetedRadius or CONFIG.contactRadius
-					local eligible = (ball.real == true and aimed)
-						or (CONFIG.fallback and ball.real ~= false)
+					local unknownTarget = ball.target == nil or ball.target == ""
+					local eligible = ball.real == true and (aimed or (CONFIG.fallback and unknownTarget))
 
 					if eligible and missDistance <= allowedMiss then
 						local impactTime = math.max(0, (distance - CONFIG.contactRadius) / closing)
-						if impactTime < bestTime then
+						if not best or (aimed and not best.aimed) or (aimed == best.aimed and impactTime < bestTime) then
 							bestTime = impactTime
 							best = {
 								ball = ball,
@@ -354,6 +370,8 @@ local function update()
 
 	local root = getRoot()
 	if not root then
+		tracked = {}
+		firedAt = {}
 		currentThreat = nil
 		updateGui()
 		return
@@ -374,7 +392,9 @@ local function update()
 
 	local key = ballKey(threat.ball)
 	local previous = firedAt[key]
-	if previous and now - previous < CONFIG.sameBallRetry then return end
+	-- One input per approach. Re-arm on a target change or outgoing motion.
+	if previous then return end
+	if type(isrbxactive) == "function" and not isrbxactive() then return end
 
 	if fireParry() then
 		lastClick = now
@@ -382,9 +402,10 @@ local function update()
 		parryCount = parryCount + 1
 	end
 
-	for oldKey, timestamp in pairs(firedAt) do
-		if now - timestamp > 2 then
+	for oldKey, state in pairs(tracked) do
+		if now - state.seen > 2 then
 			firedAt[oldKey] = nil
+			tracked[oldKey] = nil
 		end
 	end
 end
@@ -402,10 +423,10 @@ if inputOk and inputSignal then
 		local ok, keyCode = pcall(function()
 			return input.KeyCode
 		end)
-		if ok and keyCode == Enum.KeyCode.T then
+		if ok and (keyCode == Enum.KeyCode.T or keyCode == 84) then
 			CONFIG.enabled = not CONFIG.enabled
 			print("Matcha auto-parry " .. (CONFIG.enabled and "enabled" or "disabled"))
-		elseif ok and keyCode == Enum.KeyCode.P then
+		elseif ok and (keyCode == Enum.KeyCode.P or keyCode == 80) then
 			guiVisible = not guiVisible
 			updateGui()
 		end
