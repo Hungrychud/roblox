@@ -22,6 +22,7 @@ local CONFIG = {
 	contactRadius = 4.5,
 	targetedRadius = 18,
 	baseLead = 0.12,
+	pingComp = true,
 	pingFactor = 0.75,
 	maxLead = 0.42,
 	minInterval = 0.055,
@@ -34,6 +35,156 @@ local lastClick = 0
 local firedAt = {}
 local renderConnection = nil
 local inputConnection = nil
+local currentThreat = nil
+local lastPing = 0
+local parryCount = 0
+local guiVisible = true
+local drawings = {}
+local buttons = {}
+
+-------------------------------------------------------------------------
+-- Matcha Drawing GUI
+-------------------------------------------------------------------------
+local GUI = {
+	x = 20,
+	y = 100,
+	w = 270,
+	row = 29,
+	background = nil,
+	title = nil,
+	status = nil,
+	ready = false,
+}
+
+local function setDrawing(object, properties)
+	if not object then return end
+	for key, value in pairs(properties) do
+		pcall(function() object[key] = value end)
+	end
+end
+
+local function newDrawing(kind, properties)
+	if Drawing == nil or type(Drawing.new) ~= "function" then return nil end
+	local ok, object = pcall(function() return Drawing.new(kind) end)
+	if not ok or not object then return nil end
+	drawings[#drawings + 1] = object
+	setDrawing(object, properties)
+	return object
+end
+
+local function addButton(y, xOffset, width, label, action)
+	local button = {
+		x = GUI.x + xOffset,
+		y = y,
+		w = width,
+		h = 24,
+		label = label,
+		action = action,
+	}
+	button.box = newDrawing("Square", {
+		Position = Vector2.new(button.x, button.y),
+		Size = Vector2.new(button.w, button.h),
+		Filled = true,
+		Color = Color3.fromRGB(34, 39, 52),
+		Transparency = 0.95,
+		Thickness = 1,
+		Visible = true,
+	})
+	button.text = newDrawing("Text", {
+		Position = Vector2.new(button.x + 8, button.y + 5),
+		Size = 14,
+		Font = 2,
+		Outline = true,
+		Color = Color3.fromRGB(225, 230, 240),
+		Visible = true,
+	})
+	buttons[#buttons + 1] = button
+end
+
+local function buildGui()
+	GUI.background = newDrawing("Square", {
+		Position = Vector2.new(GUI.x, GUI.y),
+		Size = Vector2.new(GUI.w, 235),
+		Filled = true,
+		Color = Color3.fromRGB(15, 18, 27),
+		Transparency = 0.94,
+		Thickness = 1,
+		Visible = true,
+	})
+	GUI.title = newDrawing("Text", {
+		Position = Vector2.new(GUI.x + 10, GUI.y + 9),
+		Text = "MATCHA AUTO PARRY",
+		Size = 17,
+		Font = 2,
+		Outline = true,
+		Color = Color3.fromRGB(100, 210, 255),
+		Visible = true,
+	})
+	GUI.status = newDrawing("Text", {
+		Position = Vector2.new(GUI.x + 10, GUI.y + 34),
+		Size = 13,
+		Font = 2,
+		Outline = true,
+		Color = Color3.fromRGB(180, 190, 205),
+		Visible = true,
+	})
+
+	local y = GUI.y + 61
+	addButton(y, 8, GUI.w - 16, function()
+		return "Auto parry: " .. (CONFIG.enabled and "ON" or "OFF") .. "  [T]"
+	end, function() CONFIG.enabled = not CONFIG.enabled end)
+	y = y + GUI.row
+	addButton(y, 8, GUI.w - 16, function()
+		return "Fallback targeting: " .. (CONFIG.fallback and "ON" or "OFF")
+	end, function() CONFIG.fallback = not CONFIG.fallback end)
+	y = y + GUI.row
+	addButton(y, 8, GUI.w - 16, function()
+		return "Ping compensation: " .. (CONFIG.pingComp and "ON" or "OFF")
+	end, function() CONFIG.pingComp = not CONFIG.pingComp end)
+	y = y + GUI.row
+	addButton(y, 8, 124, function()
+		return "Lead -  (" .. math.floor(CONFIG.baseLead * 1000) .. "ms)"
+	end, function() CONFIG.baseLead = math.max(0.02, CONFIG.baseLead - 0.01) end)
+	addButton(y, 138, 124, function() return "Lead +" end,
+		function() CONFIG.baseLead = math.min(CONFIG.maxLead, CONFIG.baseLead + 0.01) end)
+	y = y + GUI.row
+	addButton(y, 8, 124, function()
+		return "Range -  (" .. math.floor(CONFIG.maxRange) .. ")"
+	end, function() CONFIG.maxRange = math.max(30, CONFIG.maxRange - 10) end)
+	addButton(y, 138, 124, function() return "Range +" end,
+		function() CONFIG.maxRange = math.min(300, CONFIG.maxRange + 10) end)
+
+	GUI.ready = GUI.background ~= nil and GUI.title ~= nil and GUI.status ~= nil
+end
+
+local function updateGui()
+	if not GUI.ready then return end
+	for _, object in ipairs(drawings) do
+		pcall(function() object.Visible = guiVisible end)
+	end
+	if not guiVisible then return end
+
+	local stateColor = CONFIG.enabled and Color3.fromRGB(100, 235, 145)
+		or Color3.fromRGB(255, 105, 105)
+	setDrawing(GUI.title, {Color = stateColor})
+
+	local threatText = "no incoming ball"
+	if currentThreat then
+		threatText = string.format("ball %.2fs | %s", currentThreat.tti,
+			currentThreat.aimed and "TARGETED" or "fallback")
+	end
+	setDrawing(GUI.status, {
+		Text = string.format("%s | ping %dms | parries %d", threatText,
+			math.floor(lastPing * 1000), parryCount),
+	})
+
+	for _, button in ipairs(buttons) do
+		local text = type(button.label) == "function" and button.label() or button.label
+		setDrawing(button.text, {Text = text})
+	end
+end
+
+buildGui()
 
 local function safeAttribute(instance, name)
 	local ok, value = pcall(function()
@@ -199,15 +350,23 @@ local function chooseThreat(rootPosition)
 end
 
 local function update()
-	if not running or not CONFIG.enabled then return end
+	if not running then return end
 
 	local root = getRoot()
-	if not root then return end
+	if not root then
+		currentThreat = nil
+		updateGui()
+		return
+	end
 
 	local threat = chooseThreat(root.Position)
-	if not threat then return end
+	currentThreat = threat
+	lastPing = pingSeconds()
+	updateGui()
+	if not CONFIG.enabled or not threat then return end
 
-	local lead = math.min(CONFIG.maxLead, CONFIG.baseLead + pingSeconds() * CONFIG.pingFactor)
+	local pingLead = CONFIG.pingComp and lastPing * CONFIG.pingFactor or 0
+	local lead = math.min(CONFIG.maxLead, CONFIG.baseLead + pingLead)
 	if threat.tti > lead then return end
 
 	local now = os.clock()
@@ -220,6 +379,7 @@ local function update()
 	if fireParry() then
 		lastClick = now
 		firedAt[key] = now
+		parryCount = parryCount + 1
 	end
 
 	for oldKey, timestamp in pairs(firedAt) do
@@ -245,6 +405,23 @@ if inputOk and inputSignal then
 		if ok and keyCode == Enum.KeyCode.T then
 			CONFIG.enabled = not CONFIG.enabled
 			print("Matcha auto-parry " .. (CONFIG.enabled and "enabled" or "disabled"))
+		elseif ok and keyCode == Enum.KeyCode.P then
+			guiVisible = not guiVisible
+			updateGui()
+		end
+
+		local mouseOk, inputType, position = pcall(function()
+			return input.UserInputType, input.Position
+		end)
+		if mouseOk and inputType == Enum.UserInputType.MouseButton1 and guiVisible and position then
+			for _, button in ipairs(buttons) do
+				if position.X >= button.x and position.X <= button.x + button.w
+					and position.Y >= button.y and position.Y <= button.y + button.h then
+					button.action()
+					updateGui()
+					break
+				end
+			end
 		end
 	end)
 end
@@ -253,8 +430,11 @@ _G.BB_MATCHA_STOP = function()
 	running = false
 	if renderConnection then renderConnection:Disconnect() end
 	if inputConnection then inputConnection:Disconnect() end
+	for _, object in ipairs(drawings) do
+		pcall(function() object:Remove() end)
+	end
 	firedAt = {}
 	_G.BB_MATCHA_STOP = nil
 end
 
-print("Matcha local auto-parry loaded (T to toggle)")
+print("Matcha local auto-parry loaded (T toggle, P show/hide GUI)")
