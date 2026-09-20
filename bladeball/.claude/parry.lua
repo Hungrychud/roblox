@@ -16,11 +16,11 @@ end
 
 local CONFIG = {
 	enabled = true,
+	autoTune = true,
 	ballsFolder = "Balls",
 	minSpeed = 5,
 	maxRange = 140,
 	contactRadius = 4.5,
-	targetedRadius = 18,
 	baseLead = 0.12,
 	pingComp = true,
 	pingFactor = 0.75,
@@ -36,7 +36,7 @@ local CONFIG = {
 }
 
 local running = true
-local lastClick = 0
+local lastClick = -math.huge
 local firedAt = {}
 local tracked = {}
 local renderConnection = nil
@@ -45,6 +45,99 @@ local lastPing = 0
 local parryCount = 0
 local menuOpen = true
 local lastUiUpdate = 0
+local lastFrameAt = nil
+local lastCleanup = 0
+local activeRoot = nil
+local metrics = {frame = 1 / 60, frameJitter = 0, frames = 0,
+	ping = 0, pingJitter = 0, hasPing = false, nextPing = 0, pingAt = -math.huge}
+
+-- BEGIN PARRY MATH (pure functions, also exercised by the regression checks)
+local function finite(n)
+	return type(n) == "number" and n == n and math.abs(n) < math.huge
+end
+
+local function validVector(v)
+	return v ~= nil and finite(v.X) and finite(v.Y) and finite(v.Z)
+end
+
+local function timingProfile(config, stats)
+	local frame = math.clamp(stats.frame + stats.frameJitter * 2, 1 / 240, 0.080)
+	local network = config.pingComp and stats.hasPing and stats.ping or 0
+	local jitter = config.pingComp and stats.hasPing and stats.pingJitter or 0
+	if config.autoTune then
+		return {
+			-- Assume measured ping is round-trip. Include one-way transport,
+			-- a bounded jitter allowance, and the time until the next sample.
+			lead = math.clamp(0.055 + network * 0.5 + math.min(jitter * 1.5, 0.035) + frame * 1.25, 0.060, 0.260),
+			frame = frame,
+			interval = math.clamp(frame, 0.012, 0.040),
+			retry = math.clamp(math.max(frame * 2, network * 0.65 + jitter + 0.025), 0.035, 0.140),
+			range = 0, -- determined from each ball's speed below
+			clashRange = math.clamp(14 + frame * 180 + network * 35, 16, 34),
+		}
+	end
+	return {lead = math.min(config.maxLead, config.baseLead + network * config.pingFactor),
+		frame = frame, interval = config.minInterval, retry = config.clashRetry,
+		range = config.maxRange, clashRange = config.clashRange}
+end
+
+local function detectionRange(config, profile, speed)
+	if not config.autoTune then return profile.range end
+	return math.clamp(config.contactRadius + speed * (profile.lead + profile.frame * 2) + 12, 40, 500)
+end
+
+local function impactTime(offset, relativeVelocity, radius)
+	-- Solve |offset - relativeVelocity*t|^2 = radius^2. Radial distance /
+	-- closing speed alone wrongly predicts collisions for passing balls.
+	local speedSquared = relativeVelocity:Dot(relativeVelocity)
+	if speedSquared < 0.001 then return nil end
+	local approach = offset:Dot(relativeVelocity)
+	if approach <= 0 then return nil end
+	local c = offset:Dot(offset) - radius * radius
+	if c <= 0 then return 0 end
+	local discriminant = approach * approach - speedSquared * c
+	if discriminant < 0 then return nil end
+	-- Equivalent to the smaller quadratic root, with less cancellation.
+	return c / (approach + math.sqrt(discriminant))
+end
+
+local function canAttempt(now, previous, state, isClash, retryDelay, limit)
+	if previous == nil then return true end
+	return isClash and now - previous >= retryDelay
+		and (state.retries or 0) < limit
+		and state.revision > (state.sentRevision or 0)
+end
+-- END PARRY MATH
+
+local effective = timingProfile(CONFIG, metrics)
+
+local function samplePerformance(now)
+	if lastFrameAt then
+		local dt = now - lastFrameAt
+		if finite(dt) and dt > 0 and dt < 0.25 then
+			local alpha = 1 - math.exp(-dt / 0.75)
+			local deviation = math.abs(dt - metrics.frame)
+			metrics.frame = metrics.frame + alpha * (dt - metrics.frame)
+			metrics.frameJitter = metrics.frameJitter + alpha * (deviation - metrics.frameJitter)
+			metrics.frames = metrics.frames + 1
+		end
+	end
+	lastFrameAt = now
+	if now >= metrics.nextPing then
+		metrics.nextPing = now + 0.25
+		local ok, value = pcall(function() return GetPingValue() end)
+		if ok and finite(value) and value >= 0 and value <= 2000 then
+			local seconds = math.min(value, 600) / 1000
+			if metrics.hasPing then
+				metrics.pingJitter = metrics.pingJitter * 0.8 + math.abs(seconds - metrics.ping) * 0.2
+				metrics.ping = metrics.ping * 0.75 + seconds * 0.25
+			else metrics.ping, metrics.pingJitter = seconds, 0 end
+			metrics.hasPing, metrics.pingAt = true, now
+		elseif now - metrics.pingAt > 2 then metrics.hasPing = false end
+	end
+	lastPing = metrics.ping
+	effective = timingProfile(CONFIG, metrics)
+end
 
 -- Load the user-selected Matcha UI library.
 local fetched, source = pcall(function()
@@ -101,13 +194,14 @@ local loadedLibrary = uiChunk()
 local Library = WabiSabi or loadedLibrary
 assert(type(Library) == "table" and type(Library.CreateWindow) == "function", "Invalid WabiSabi UI")
 Library.HelpText = {
+	["Automatic tuning"] = "Uses smoothed ping, network jitter, frame time and ball speed to choose timing, detection range and close-range retry delay. Turn it off to use the manual sliders. These are bounded estimates, not guaranteed optimal settings.",
 	["Auto parry"] = "Automatically clicks when an incoming real ball reaches your parry timing window. T toggles it. Minimize with P to play.",
 	["Close-range retries"] = "Allows up to two extra attempts during fast, nearby exchanges if a rebound was missed between updates.",
 	["Fallback targeting"] = "Considers incoming real balls with an unknown target. Balls assigned to another player are still ignored.",
-	["Ping compensation"] = "Adds part of your measured network delay to the timing lead, so inputs are sent earlier when latency rises.",
-	["Reaction lead (ms)"] = "How early to click before predicted contact. Higher values click earlier; too high can waste the parry window.",
-	["Detection range (studs)"] = "Maximum distance at which balls are considered. Increasing this does not increase the game's actual parry range.",
-	["Close-range distance (studs)"] = "Distance within which fast incoming balls may use the shorter cooldown and bounded retries. Requires close-range retries enabled.",
+	["Ping compensation"] = "Accounts for measured network delay and its variation. Automatic tuning assumes the ping reading is round-trip. Turn off to use frame timing only.",
+	["Reaction lead (ms)"] = "Manual setting, used only when automatic tuning is off. Higher values click earlier; too high can waste the parry window.",
+	["Detection range (studs)"] = "Manual setting, used only when automatic tuning is off. Automatic mode expands detection with ball speed; it does not change the game's actual parry range.",
+	["Close-range distance (studs)"] = "Manual setting, used only when automatic tuning is off. Controls where fast incoming balls may use bounded retries. Requires close-range retries enabled.",
 	["Theme"] = "Changes the window colors. It does not change auto-parry behavior.",
 	["Minimize and play"] = "Collapses the menu into a small bubble and lets auto-parry run when enabled. Press P or click the bubble to restore it.",
 	["Unload script"] = "Stops auto-parry and removes this UI. Run the loader again to restart.",
@@ -148,6 +242,12 @@ Controls:AddToggle({
 local Status = Main:AddParagraph({Title = "Live status", Content = "Waiting for ball"})
 
 local Timing = Window:AddTab({Title = "Timing"})
+Timing:AddToggle({
+	Id = "AutoTune", Title = "Automatic tuning", Default = CONFIG.autoTune,
+	Callback = function(value) CONFIG.autoTune = value end,
+})
+local TuningStatus = Timing:AddParagraph({Title = "Effective settings", Content = "Measuring ping and frame time..."})
+Timing:AddSection("Manual settings (automatic tuning OFF)")
 Timing:AddSlider({
 	Id = "Lead", Title = "Reaction lead (ms)", Default = CONFIG.baseLead * 1000,
 	Min = 20, Max = CONFIG.maxLead * 1000, Rounding = 0,
@@ -185,7 +285,14 @@ local function updateGui()
 	lastUiUpdate = now
 	local mode = not CONFIG.enabled and "Disabled" or (menuOpen and "Paused while menu is open" or "Active")
 	local threat = currentThreat and string.format("Incoming: %.2fs", currentThreat.tti) or "Waiting for ball"
-	Status:SetContent(string.format("%s | %s\nPing: %d ms | Attempts: %d", mode, threat, math.floor(lastPing * 1000), parryCount))
+	local pingText = metrics.hasPing and string.format("%d ms", math.floor(lastPing * 1000 + 0.5)) or "unavailable"
+	local fpsText = metrics.frames >= 10 and tostring(math.floor(1 / metrics.frame + 0.5)) or "measuring"
+	Status:SetContent(string.format("%s | %s\nPing: %s | FPS estimate: %s | Attempts: %d", mode, threat, pingText, fpsText, parryCount))
+	local rangeText = currentThreat and string.format("%.0f studs", currentThreat.range)
+		or (CONFIG.autoTune and "40-500 studs, based on speed" or tostring(CONFIG.maxRange) .. " studs")
+	TuningStatus:SetContent(string.format("%s | Lead: %.0f ms | Retry: %.0f ms\nRange: %s | Close range: %.0f studs\nPing jitter: %.0f ms | Frame budget: %.1f ms",
+		CONFIG.autoTune and "Automatic" or "Manual", effective.lead * 1000, effective.retry * 1000,
+		rangeText, effective.clashRange, metrics.pingJitter * 1000, effective.frame * 1000))
 end
 
 local function safeAttribute(instance, name)
@@ -239,63 +346,51 @@ local function getBallPart(object)
 	return nil
 end
 
-local function readBall(object)
+local function readBall(object, now)
 	local part = getBallPart(object)
 	if not part then return nil end
+	local key = part.Address
+	if not key then return nil end -- never key by Matcha's temporary wrappers
+	local state = tracked[key]
+	if not state then state = {revision = 0, retries = 0}; tracked[key] = state end
+	state.seen = now
 
-	local positionOk, position = pcall(function()
-		return part.Position
-	end)
-	local velocityOk, velocity = pcall(function()
-		return part.AssemblyLinearVelocity
-	end)
-	if not velocityOk or not velocity then
-		velocityOk, velocity = pcall(function()
-			return part.Velocity
-		end)
-	end
-	if not positionOk or not velocityOk or not position or not velocity then
-		return nil
-	end
-
-	local speed = velocity.Magnitude
-	if speed < CONFIG.minSpeed then return nil end
-
-	local realBall = safeAttribute(object, "realBall")
-	if realBall == nil and object ~= part then
-		realBall = safeAttribute(part, "realBall")
-	end
-	if realBall == false then return nil end
-
+	local real = safeAttribute(object, "realBall")
+	if real == nil then real = safeAttribute(part, "realBall") end
+	if real ~= true then return nil end
 	local target = safeAttribute(object, "target") or safeAttribute(object, "Target")
-	if target == nil and object ~= part then
-		target = safeAttribute(part, "target") or safeAttribute(part, "Target")
+	if target == nil then target = safeAttribute(part, "target") or safeAttribute(part, "Target") end
+
+	local position = part.Position
+	if not validVector(position) then return nil end
+	local dt = state.sampleAt and now - state.sampleAt or 0
+	local displacement = state.position and position - state.position or nil
+	local velocity = part.AssemblyLinearVelocity
+	if not validVector(velocity) then velocity = part.Velocity end
+	-- Script-driven motion can report zero assembly velocity. Only use a recent,
+	-- plausible positional difference; don't extrapolate across a teleport.
+	if (not validVector(velocity) or velocity.Magnitude < 0.01)
+		and displacement and dt > 0.001 and dt < 0.15 then
+		local measured = displacement / dt
+		if measured.Magnitude < 6000 then velocity = measured end
 	end
+	if not validVector(velocity) then velocity = Vector3.new(0, 0, 0) end
+	if velocity.Magnitude > 6000 then return nil end
 
-	return {
-		object = object,
-		part = part,
-		position = position,
-		velocity = velocity,
-		speed = speed,
-		target = target,
-		real = realBall,
-	}
-end
-
-local function ballKey(ball)
-	local ok, address = pcall(function()
-		return ball.object.Address
-	end)
-	if ok and address ~= nil then return address end
-	return ball.object
-end
-
-local function pingSeconds()
-	if type(GetPingValue) ~= "function" then return 0 end
-	local ok, value = pcall(GetPingValue)
-	if not ok or type(value) ~= "number" then return 0 end
-	return math.clamp(value, 0, 400) / 1000
+	local changedTarget = target ~= state.target
+	if changedTarget then
+		firedAt[key], state.retries = nil, 0
+		state.target = target
+	end
+	if changedTarget or not state.position or displacement.Magnitude > 0.02
+		or not state.velocity or (velocity - state.velocity).Magnitude > 1 then
+		state.revision = state.revision + 1
+	end
+	state.position, state.velocity, state.sampleAt = position, velocity, now
+	local size = part.Size
+	local ballRadius = validVector(size) and math.clamp(math.max(size.X, size.Y, size.Z) * 0.5, 0, 4) or 0
+	return {key = key, position = position, velocity = velocity, speed = velocity.Magnitude,
+		target = target, radius = CONFIG.contactRadius + ballRadius, state = state}
 end
 
 local function fireParry()
@@ -311,115 +406,93 @@ local function fireParry()
 	return ok and result ~= false
 end
 
-local function chooseThreat(rootPosition)
+local function chooseThreat(root, now)
 	local folder = Workspace:FindFirstChild(CONFIG.ballsFolder)
 	if not folder then return nil end
-
+	local rootPosition = root.Position
+	if not validVector(rootPosition) then return nil end
+	local rootVelocity = root.AssemblyLinearVelocity
+	if not validVector(rootVelocity) or rootVelocity.Magnitude > 200 then
+		rootVelocity = Vector3.new(0, 0, 0)
+	end
 	local best = nil
-	local bestTime = math.huge
-
 	for _, object in ipairs(folder:GetChildren()) do
-		local ball = readBall(object)
+		local ball = readBall(object, now)
 		if ball then
 			local offset = rootPosition - ball.position
 			local distance = offset.Magnitude
-			local key = ballKey(ball)
-			local state = tracked[key]
-			if not state then state = {}; tracked[key] = state end
-			state.seen = os.clock()
-			if state.target ~= ball.target then
-				firedAt[key] = nil
-				state.retries = 0
-				state.target = ball.target
+			local relativeVelocity = ball.velocity - rootVelocity
+			local closingDot = offset:Dot(relativeVelocity)
+			local state = ball.state
+			-- Require meaningful outgoing motion to rearm; near-zero noise is
+			-- not evidence of a new approach.
+			if closingDot < -math.max(distance, 1) * 2 then
+				firedAt[ball.key], state.retries = nil, 0
 			end
-			if distance > 0.001 and ball.velocity:Dot(offset / distance) <= 0 then
-				firedAt[key] = nil
-				state.retries = 0
-			end
-
-			if distance > 0.001 and distance <= CONFIG.maxRange then
-				local closing = ball.velocity:Dot(offset / distance)
-
-				if closing > 0 then
-					local closestTime = math.max(0, offset:Dot(ball.velocity) / (ball.speed * ball.speed))
-					local closestPoint = ball.position + ball.velocity * closestTime
-					local missDistance = (rootPosition - closestPoint).Magnitude
-					local aimed = ball.target == player.Name
-					local allowedMiss = aimed and CONFIG.targetedRadius or CONFIG.contactRadius
-					local unknownTarget = ball.target == nil or ball.target == ""
-					local eligible = ball.real == true and (aimed or (CONFIG.fallback and unknownTarget))
-
-					if eligible and missDistance <= allowedMiss then
-						local impactTime = math.max(0, (distance - CONFIG.contactRadius) / closing)
-						if not best or (aimed and not best.aimed) or (aimed == best.aimed and impactTime < bestTime) then
-							bestTime = impactTime
-							best = {
-								ball = ball,
-								distance = distance,
-								tti = impactTime,
-								aimed = aimed,
-							}
-						end
-					end
+			local aimed = ball.target == player.Name
+			local unknown = ball.target == nil or ball.target == ""
+			local allowed = aimed or (CONFIG.fallback and unknown)
+			local range = detectionRange(CONFIG, effective, relativeVelocity.Magnitude)
+			if allowed and ball.speed >= CONFIG.minSpeed and distance <= range then
+				local tti = impactTime(offset, relativeVelocity, ball.radius)
+				-- Curves are re-evaluated every frame. A large miss distance is
+				-- never treated as a hit merely because target points at us.
+				if tti and (not best or (aimed and not best.aimed)
+					or (aimed == best.aimed and tti < best.tti)) then
+					best = {ball = ball, distance = distance, tti = tti, aimed = aimed, range = range}
 				end
 			end
 		end
 	end
-
 	return best
 end
 
 local function update()
 	if not running then return end
+	local now = tick()
+	samplePerformance(now)
+	-- Cleanup also runs while idle, so removed balls don't accumulate.
+	if now - lastCleanup >= 1 then
+		lastCleanup = now
+		for key, state in pairs(tracked) do
+			if now - state.seen > 2 then tracked[key], firedAt[key] = nil, nil end
+		end
+	end
 
 	local root = getRoot()
+	local rootId = root and root.Address
+	if rootId ~= activeRoot then
+		tracked, firedAt = {}, {}
+		activeRoot = rootId
+		lastClick = -math.huge
+	end
 	if not root then
-		tracked = {}
-		firedAt = {}
 		currentThreat = nil
 		updateGui()
 		return
 	end
 
-	local threat = chooseThreat(root.Position)
+	local threat = chooseThreat(root, now)
 	currentThreat = threat
-	lastPing = pingSeconds()
 	updateGui()
 	if not CONFIG.enabled or not threat or menuOpen then return end
-
-	local pingLead = CONFIG.pingComp and lastPing * CONFIG.pingFactor or 0
-	local lead = math.min(CONFIG.maxLead, CONFIG.baseLead + pingLead)
-	if threat.tti > lead then return end
-
-	local now = os.clock()
-	local clash = CONFIG.clashEnabled and threat.aimed and threat.distance <= CONFIG.clashRange
-		and threat.ball.speed >= CONFIG.clashMinSpeed
-	local interval = clash and CONFIG.clashInterval or CONFIG.minInterval
-	if now - lastClick < interval then return end
-
-	local key = ballKey(threat.ball)
-	local previous = firedAt[key]
-	local state = tracked[key]
-	-- A complete close rebound can occur between replicated samples. Permit
-	-- bounded retries only for a fast, nearby ball still targeting this player.
-	if previous then
-		if not clash or now - previous < CONFIG.clashRetry
-			or (state.retries or 0) >= CONFIG.maxClashRetries then return end
-	end
+	if threat.tti > effective.lead then return end
 	if type(isrbxactive) == "function" and not isrbxactive() then return end
 
+	local clash = CONFIG.clashEnabled and threat.aimed and threat.distance <= effective.clashRange
+		and threat.ball.speed >= CONFIG.clashMinSpeed
+	local interval = effective.interval
+	if not CONFIG.autoTune and clash then interval = CONFIG.clashInterval end
+	if now - lastClick < interval then return end
+
+	local key, state = threat.ball.key, threat.ball.state
+	local previous = firedAt[key]
+	if not canAttempt(now, previous, state, clash, effective.retry, CONFIG.maxClashRetries) then return end
 	if fireParry() then
 		if previous then state.retries = (state.retries or 0) + 1 end
-		lastClick = now
-		firedAt[key] = now
+		state.sentRevision = state.revision
+		lastClick, firedAt[key] = now, now
 		parryCount = parryCount + 1
-	end
-
-	for oldKey, state in pairs(tracked) do
-		if now - state.seen > 2 then
-			firedAt[oldKey] = nil
-			tracked[oldKey] = nil
-		end
 	end
 end
 
@@ -433,6 +506,15 @@ _G.BB_MATCHA_STOP = function()
 	Library:Stop()
 	firedAt = {}
 	_G.BB_MATCHA_STOP = nil
+	_G.BB_MATCHA_STATUS = nil
+end
+
+-- Read-only diagnostics for checking the active configuration in Matcha.
+_G.BB_MATCHA_STATUS = function()
+	return {automatic = CONFIG.autoTune, enabled = CONFIG.enabled, menuOpen = menuOpen,
+		fps = 1 / metrics.frame, pingMs = metrics.hasPing and metrics.ping * 1000 or nil,
+		leadMs = effective.lead * 1000, retryMs = effective.retry * 1000,
+		clashRange = effective.clashRange, attempts = parryCount}
 end
 
 Library:OnUnload(function()
