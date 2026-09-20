@@ -22,7 +22,13 @@ end
 
 local CONFIG = {
 	enabled = true,
+	anyIncoming = true,
 	autoTune = true,
+	earlyParry = true,
+	extraDistance = 4,
+	accelerationPrediction = true,
+	predictionPreview = true,
+	compactHud = true,
 	ballsFolder = "Balls",
 	minSpeed = 5,
 	maxRange = 140,
@@ -52,6 +58,7 @@ local lastPing = 0
 local parryCount = 0
 local menuOpen = true
 local lastUiUpdate = 0
+local lastFireDistance = nil
 local lastFrameAt = nil
 local lastCleanup = 0
 local activeRoot = nil
@@ -106,6 +113,23 @@ local function canAttempt(now, previous, state, isClash, retryDelay, limit)
 	if previous == nil then return true end
 	return isClash and now - previous >= retryDelay
 		and (state.retries or 0) < limit
+end
+
+local function interceptionDistance(config, profile, closing, acceleration)
+	local extra = config.earlyParry and config.extraDistance or 0
+	local accelerationMargin = 0
+	if config.accelerationPrediction then
+		-- Never move the trigger later. Bound extra prediction to three studs
+		-- and 25 ms of travel so a noisy velocity update cannot fire far away.
+		accelerationMargin = math.min(3, math.max(0, closing) * 0.025,
+			0.5 * math.max(0, acceleration) * profile.lead * profile.lead)
+	end
+	return config.contactRadius + extra + math.max(0, closing) * profile.lead + accelerationMargin
+end
+
+local function eligibleBall(config, real, aimed, unknownTarget)
+	-- Known visual duplicates never drive input. Source player/NPC is irrelevant.
+	return real ~= false and (config.anyIncoming or (real == true and (aimed or (config.fallback and unknownTarget))))
 end
 -- END PARRY MATH
 
@@ -194,10 +218,16 @@ local loadedLibrary = uiChunk()
 local Library = WabiSabi or loadedLibrary
 assert(type(Library) == "table" and type(Library.CreateWindow) == "function", "Invalid WabiSabi UI")
 Library.HelpText = {
+	["Any incoming ball"] = "Considers moving balls in Workspace.Balls regardless of who sent them or their target tag: players, bots, and launchers. Non-targeted balls must be on a close incoming path. Known visual duplicates are excluded.",
+	["Earlier parry"] = "Adds the extra-distance buffer to the existing speed and ping prediction. This presses parry sooner; it cannot increase the server's actual parry range.",
+	["Extra distance (studs)"] = "Additional distance before the normal trigger. Default: 4 studs. Lower this if inputs happen too early. Works in both automatic and manual modes.",
+	["Acceleration prediction"] = "Uses recent stable incoming velocity changes to allow a small earlier trigger when the ball accelerates. The extra allowance is capped at 3 studs and never delays a parry.",
+	["Prediction preview"] = "Marks the incoming ball and shows its estimated position after the timing lead. Green means it has entered the planned trigger distance. This is an estimate, not a guaranteed path.",
+	["Compact match HUD"] = "Shows current ball distance, planned trigger distance, and the distance of your last attempt while the menu is minimized. Attempts are not confirmed hits.",
 	["Automatic tuning"] = "Uses smoothed ping, network jitter, frame time and ball speed to choose timing, detection range and close-range retry delay. Turn it off to use the manual sliders. These are bounded estimates, not guaranteed optimal settings.",
 	["Auto parry"] = "Automatically clicks when an incoming real ball reaches your parry timing window. T toggles it. Minimize with P to play.",
 	["Close-range retries"] = "Allows up to two extra attempts during fast, nearby exchanges if a rebound was missed between updates.",
-	["Fallback targeting"] = "Considers incoming real balls with an unknown target. Balls assigned to another player are still ignored.",
+	["Fallback targeting"] = "When Any incoming ball is OFF, also consider incoming real balls with an unknown target. Any incoming ball overrides this target restriction.",
 	["Ping compensation"] = "Accounts for measured network delay and its variation. Automatic tuning preserves the working base timing. Turn off to omit the network margin.",
 	["Reaction lead (ms)"] = "Manual setting, used only when automatic tuning is off. Higher values click earlier; too high can waste the parry window.",
 	["Detection range (studs)"] = "Manual setting, used only when automatic tuning is off. Automatic mode expands detection with ball speed; it does not change the game's actual parry range.",
@@ -226,6 +256,10 @@ Controls:AddToggle({
 	Callback = function(value) CONFIG.enabled = value end,
 })
 Controls:AddToggle({
+	Id = "AnyIncoming", Title = "Any incoming ball", Default = CONFIG.anyIncoming,
+	Callback = function(value) CONFIG.anyIncoming = value end,
+})
+Controls:AddToggle({
 	Id = "Clash", Title = "Close-range retries", Default = CONFIG.clashEnabled,
 	Description = "Allow bounded retries during fast, close exchanges.",
 	Callback = function(value) CONFIG.clashEnabled = value end,
@@ -247,6 +281,13 @@ Timing:AddToggle({
 	Callback = function(value) CONFIG.autoTune = value end,
 })
 local TuningStatus = Timing:AddParagraph({Title = "Effective settings", Content = "Measuring ping and frame time..."})
+Timing:AddSection("Predictive distance (all modes)")
+Timing:AddToggle({Id = "EarlyParry", Title = "Earlier parry", Default = CONFIG.earlyParry,
+	Callback = function(value) CONFIG.earlyParry = value end})
+Timing:AddSlider({Id = "ExtraDistance", Title = "Extra distance (studs)", Default = CONFIG.extraDistance,
+	Min = 0, Max = 10, Rounding = 1, Callback = function(value) CONFIG.extraDistance = value end})
+Timing:AddToggle({Id = "Acceleration", Title = "Acceleration prediction", Default = CONFIG.accelerationPrediction,
+	Callback = function(value) CONFIG.accelerationPrediction = value end})
 Timing:AddSection("Manual settings (automatic tuning OFF)")
 Timing:AddSlider({
 	Id = "Lead", Title = "Reaction lead (ms)", Default = CONFIG.baseLead * 1000,
@@ -263,6 +304,12 @@ Timing:AddSlider({
 	Min = 8, Max = 40, Rounding = 0,
 	Callback = function(value) CONFIG.clashRange = value end,
 })
+
+local Visuals = Window:AddTab({Title = "Visuals"})
+Visuals:AddToggle({Id = "Preview", Title = "Prediction preview", Default = CONFIG.predictionPreview,
+	Callback = function(value) CONFIG.predictionPreview = value end})
+Visuals:AddToggle({Id = "MatchHUD", Title = "Compact match HUD", Default = CONFIG.compactHud,
+	Callback = function(value) CONFIG.compactHud = value end})
 
 local Interface = Window:AddTab({Title = "Interface"})
 Interface:AddDropdown({
@@ -284,7 +331,7 @@ local function updateGui()
 	if now - lastUiUpdate < 0.15 then return end
 	lastUiUpdate = now
 	local mode = not CONFIG.enabled and "Disabled" or (menuOpen and "Paused while menu is open" or "Active")
-	local threat = currentThreat and string.format("Incoming: %.2fs", currentThreat.tti) or "Waiting for ball"
+	local threat = currentThreat and string.format("Ball: %.1f studs | Trigger: %.1f studs", currentThreat.distance, currentThreat.triggerDistance) or "Waiting for ball"
 	local pingText = metrics.hasPing and string.format("%d ms", math.floor(lastPing * 1000 + 0.5)) or "unavailable"
 	local fpsText = metrics.frames >= 10 and tostring(math.floor(1 / metrics.frame + 0.5)) or "measuring"
 	Status:SetContent(string.format("%s | %s\nPing: %s | FPS estimate: %s | Attempts: %d", mode, threat, pingText, fpsText, parryCount))
@@ -293,6 +340,64 @@ local function updateGui()
 	TuningStatus:SetContent(string.format("%s | Lead: %.0f ms | Retry: %.0f ms\nRange: %s | Close range: %.0f studs\nPing jitter: %.0f ms | Frame budget: %.1f ms",
 		CONFIG.autoTune and "Automatic" or "Manual", effective.lead * 1000, effective.retry * 1000,
 		rangeText, effective.clashRange, metrics.pingJitter * 1000, effective.frame * 1000))
+end
+
+-- Fixed Drawing pool. Failure in the optional preview must not stop parrying.
+local overlay = {}
+local overlayObjects = {}
+local function overlayObject(kind, properties)
+	local ok, object = pcall(function()
+		local item = Drawing.new(kind)
+		overlayObjects[#overlayObjects + 1] = item
+		for key, value in pairs(properties) do item[key] = value end
+		item.Visible = false
+		return item
+	end)
+	if ok then return object end
+	return nil
+end
+overlay.hud = overlayObject("Text", {Size = 14, Font = 2, Outline = true, Position = Vector2.new(20, 58), Color = Color3.fromRGB(210, 235, 245), Transparency = 0, ZIndex = 10})
+overlay.ball = overlayObject("Circle", {Radius = 12, NumSides = 24, Filled = false, Thickness = 2, Transparency = 0, ZIndex = 10})
+overlay.future = overlayObject("Circle", {Radius = 5, NumSides = 16, Filled = false, Thickness = 1, Transparency = 0, ZIndex = 10})
+overlay.path = overlayObject("Line", {Thickness = 1, Transparency = 0, ZIndex = 10})
+overlay.label = overlayObject("Text", {Size = 13, Font = 2, Outline = true, Center = true, Transparency = 0, ZIndex = 10})
+local previewFailed = false
+local function drawPreview(root, threat)
+	for _, object in ipairs(overlayObjects) do object.Visible = false end
+	if menuOpen or (type(isrbxactive) == "function" and not isrbxactive()) then return end
+	if CONFIG.compactHud and overlay.hud then
+		local status = not CONFIG.enabled and "OFF" or (not root and "Waiting for round" or "Tracking")
+		local info = threat and string.format("ball %.1fst / trigger %.1fst", threat.distance, threat.triggerDistance) or "no incoming ball"
+		local last = lastFireDistance and string.format("%.1fst", lastFireDistance) or "none"
+		overlay.hud.Text = string.format("PARRY %s | %s\nLast attempt: %s | T toggle | P menu", status, info, last)
+		overlay.hud.Visible = true
+	end
+	if not CONFIG.predictionPreview or not threat or type(WorldToScreen) ~= "function" then return end
+	local color = threat.distance <= threat.triggerDistance and Color3.fromRGB(110, 240, 150) or Color3.fromRGB(110, 200, 255)
+	local point, visible = WorldToScreen(threat.ball.position)
+	local future, futureVisible = WorldToScreen(threat.ball.position + threat.ball.velocity * math.min(effective.lead, threat.tti))
+	if visible then
+		if overlay.ball then overlay.ball.Position = point; overlay.ball.Color = color; overlay.ball.Visible = true end
+		if overlay.label then
+			overlay.label.Position = Vector2.new(point.X, point.Y - 30)
+			overlay.label.Text = string.format("%.1fst | fire at %.1fst", threat.distance, threat.triggerDistance)
+			overlay.label.Color = color; overlay.label.Visible = true
+		end
+	end
+	if visible and futureVisible then
+		if overlay.path then overlay.path.From = point; overlay.path.To = future; overlay.path.Color = color; overlay.path.Visible = true end
+		if overlay.future then overlay.future.Position = future; overlay.future.Color = color; overlay.future.Visible = true end
+	end
+end
+
+local function updatePreview(root, threat)
+	if previewFailed then return end
+	local ok, err = pcall(function() drawPreview(root, threat) end)
+	if not ok then
+		previewFailed = true
+		for _, object in ipairs(overlayObjects) do pcall(function() object.Visible = false end) end
+		warn("Prediction preview disabled: " .. tostring(err))
+	end
 end
 
 local function safeAttribute(instance, name)
@@ -424,23 +529,36 @@ local function chooseThreat(root, now)
 			state.seen = now
 			if state.target ~= ball.target then
 				firedAt[key], state.retries = nil, 0
+				state.acceleration, state.closing, state.sampleAt, state.velocity = 0, nil, nil, nil
 				state.target = ball.target
 			end
 			local offset = root.Position - ball.position
 			local distance = offset.Magnitude
-			if distance > 0.001 and ball.velocity:Dot(offset / distance) <= 0 then
+			local closing = distance > 0.001 and ball.velocity:Dot(offset / distance) or 0
+			local dt = state.sampleAt and now - state.sampleAt or 0
+			local stable = state.velocity and state.velocity.Magnitude > 0
+				and ball.velocity.Unit:Dot(state.velocity.Unit) > 0.95
+			if stable and state.closing and closing > 0 and dt >= 0.004 and dt <= 0.1 then
+				local gain = math.clamp((closing - state.closing) / dt, 0, closing * 2)
+				state.acceleration = (state.acceleration or 0) * 0.75 + gain * 0.25
+			else state.acceleration = 0 end
+			state.closing, state.sampleAt, state.velocity = closing, now, ball.velocity
+			if distance > 0.001 and closing <= 0 then
 				firedAt[key], state.retries = nil, 0
 			end
 			local aimed = ball.target == player.Name
 			local unknown = ball.target == nil or ball.target == ""
-			local eligible = ball.real == true and (aimed or (CONFIG.fallback and unknown))
-			local range = detectionRange(CONFIG, effective, ball.speed)
+			local eligible = eligibleBall(CONFIG, ball.real, aimed, unknown)
+			local trigger = interceptionDistance(CONFIG, effective, closing, state.acceleration)
+			local range = math.max(detectionRange(CONFIG, effective, ball.speed), trigger + 4)
 			if eligible and distance <= range then
 				local allowedMiss = aimed and CONFIG.targetedRadius or CONFIG.contactRadius
 				local tti = impactTime(offset, ball.velocity, CONFIG.contactRadius, allowedMiss)
-				if tti and (not best or (aimed and not best.aimed) or (aimed == best.aimed and tti < best.tti)) then
+				local better = tti and (not best or (CONFIG.anyIncoming and tti < best.tti)
+					or (not CONFIG.anyIncoming and ((aimed and not best.aimed) or (aimed == best.aimed and tti < best.tti))))
+				if better then
 					ball.key, ball.state = key, state
-					best = {ball = ball, distance = distance, tti = tti, aimed = aimed, range = range}
+					best = {ball = ball, distance = distance, tti = tti, aimed = aimed, range = range, triggerDistance = trigger}
 				end
 			end
 		end
@@ -470,17 +588,19 @@ local function update()
 	if not root then
 		currentThreat = nil
 		updateGui()
+		updatePreview(nil, nil)
 		return
 	end
 
 	local threat = chooseThreat(root, now)
 	currentThreat = threat
 	updateGui()
+	updatePreview(root, threat)
 	if not CONFIG.enabled or not threat or menuOpen then return end
-	if threat.tti > effective.lead then return end
+	if threat.distance > threat.triggerDistance then return end
 	if type(isrbxactive) == "function" and not isrbxactive() then return end
 
-	local clash = CONFIG.clashEnabled and threat.aimed and threat.distance <= effective.clashRange
+	local clash = CONFIG.clashEnabled and (threat.aimed or CONFIG.anyIncoming) and threat.distance <= effective.clashRange
 		and threat.ball.speed >= CONFIG.clashMinSpeed
 	local interval = effective.interval
 	if clash then interval = CONFIG.clashInterval end
@@ -493,6 +613,7 @@ local function update()
 		if previous then state.retries = (state.retries or 0) + 1 end
 		lastClick, firedAt[key] = now, now
 		parryCount = parryCount + 1
+		lastFireDistance = threat.distance
 	end
 end
 
@@ -504,6 +625,7 @@ _G.BB_MATCHA_STOP = function()
 	running = false
 	if renderConnection then renderConnection:Disconnect() end
 	Library:Stop()
+	for _, object in ipairs(overlayObjects) do pcall(function() object:Remove() end) end
 	firedAt = {}
 	_G.BB_MATCHA_STOP = nil
 	_G.BB_MATCHA_STATUS = nil
@@ -514,7 +636,9 @@ _G.BB_MATCHA_STATUS = function()
 	return {automatic = CONFIG.autoTune, enabled = CONFIG.enabled, menuOpen = menuOpen,
 		fps = 1 / metrics.frame, pingMs = metrics.hasPing and metrics.ping * 1000 or nil,
 		leadMs = effective.lead * 1000, retryMs = effective.retry * 1000,
-		clashRange = effective.clashRange, attempts = parryCount}
+		clashRange = effective.clashRange, attempts = parryCount,
+		lastFireDistance = lastFireDistance, triggerDistance = currentThreat and currentThreat.triggerDistance,
+		extraDistance = CONFIG.earlyParry and CONFIG.extraDistance or 0}
 end
 
 Library:OnUnload(function()

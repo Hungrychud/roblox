@@ -6,7 +6,7 @@ local first = assert(source:find("-- BEGIN PARRY MATH", 1, true))
 local last = assert(source:find("-- END PARRY MATH", first, true))
 local mathSource = source:sub(first, last - 1)
 local core = assert(loadstring(mathSource .. [[
-return {profile = timingProfile, range = detectionRange, impact = impactTime,
+return {eligible = eligibleBall, intercept = interceptionDistance, profile = timingProfile, range = detectionRange, impact = impactTime,
     attempt = canAttempt, finite = finite}
 ]]))()
 local count = 0
@@ -58,4 +58,27 @@ check(core.attempt(1, 0.9, state, true, 0.045, 2), "close retry does not require
 state.retries = 2
 check(not core.attempt(1, 0.9, state, true, 0.045, 2), "retry cap")
 check(not core.finite(0 / 0) and not core.finite(math.huge), "invalid numbers")
-print("PASS: " .. count .. " restored-trigger regression checks")
+config.earlyParry, config.extraDistance, config.accelerationPrediction = true, 4, true
+local profile = {lead = 0.15}
+local base = core.intercept(config, profile, 100, 0)
+check(close(base, 23.5), "100 stud/s ball triggers at 23.5 studs")
+check(core.intercept(config, profile, 200, 0) > base, "faster approach triggers farther out")
+check(core.intercept(config, {lead = 0.20}, 100, 0) > base, "higher lead triggers farther out")
+check(core.intercept(config, profile, 100, 10000) <= base + 3, "acceleration allowance capped")
+check(core.intercept(config, profile, 100, -100) == base, "deceleration does not delay trigger")
+config.accelerationPrediction = false
+check(core.intercept(config, profile, 100, 10000) == base, "acceleration toggle honored")
+config.earlyParry = false
+check(close(core.intercept(config, profile, 100, 0), 19.5), "extra distance toggle restores baseline")
+config.earlyParry, config.extraDistance = true, 0
+check(close(core.intercept(config, profile, 100, 0), 19.5), "zero buffer restores baseline")
+config.anyIncoming = true
+check(core.eligible(config, true, false, false), "other target considered in any-ball mode")
+check(core.eligible(config, nil, false, true), "untagged launcher ball considered")
+check(not core.eligible(config, false, true, false), "visual duplicate excluded")
+config.anyIncoming, config.fallback = false, false
+check(not core.eligible(config, true, false, false), "target restriction can be restored")
+check(core.eligible(config, true, true, false), "own targeted ball retained")
+config.fallback = true
+check(core.eligible(config, true, false, true), "unknown-target fallback retained")
+print("PASS: " .. count .. " parry regression checks")
