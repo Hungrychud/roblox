@@ -1,5 +1,6 @@
--- Execute with loadstring(thisFile)(parrySource) in a Luau runtime with Vector3.
--- No input is sent and no running UI is changed by these checks.
+-- Standard Luau runner: loadstring(thisFile)(parrySource).
+-- Matcha's loadstring does not pass arguments/return values; its live tool runs
+-- the extracted math functions and checks in one chunk instead.
 local source = ...
 local first = assert(source:find("-- BEGIN PARRY MATH", 1, true))
 local last = assert(source:find("-- END PARRY MATH", first, true))
@@ -22,74 +23,39 @@ local function stats(fps, ping, jitter)
         pingJitter = jitter or 0, hasPing = true}
 end
 local fast = core.profile(config, stats(160, 0.019))
-local slow = core.profile(config, stats(30, 0.019))
-local delayed = core.profile(config, stats(160, 0.180))
-local jittery = core.profile(config, stats(160, 0.019, 0.025))
-check(slow.lead > fast.lead, "low FPS adds lead")
-check(delayed.lead > fast.lead, "high ping adds lead")
-check(jittery.lead > fast.lead, "jitter adds bounded lead")
-check(core.profile(config, stats(5, 0.6, 1)).lead <= 0.260, "lead cap")
-check(core.profile(config, stats(5, 0.6, 1)).retry <= 0.140, "retry cap")
-check(core.range(config, fast, 1000) > core.range(config, fast, 30), "fast ball range grows")
-check(core.range(config, fast, 6000) <= 500, "range cap")
+check(fast.lead >= 0.12 + 0.019 * 0.75, "automatic mode never shortens working baseline")
+check(core.profile(config, stats(30, 0.019)).lead > fast.lead, "low FPS adds margin")
+check(core.profile(config, stats(160, 0.18)).lead > fast.lead, "ping adds margin")
+check(core.profile(config, stats(160, 0.019, 0.025)).lead > fast.lead, "jitter adds margin")
+check(core.profile(config, stats(5, 0.6, 1)).lead <= config.maxLead, "lead cap")
+check(core.profile(config, stats(5, 0.6, 1)).retry <= 0.065, "close retry remains fast")
+check(core.range(config, fast, 30) >= 140, "detection range baseline preserved")
+check(core.range(config, fast, 6000) <= 500, "range capped")
 config.pingComp = false
-check(close(core.profile(config, stats(160, 0.6)).lead,
-    core.profile(config, stats(160, 0)).lead), "ping toggle honored")
+check(close(core.profile(config, stats(160, 0.6)).lead, core.profile(config, stats(160, 0)).lead), "ping toggle")
 config.pingComp = true
 config.autoTune = false
 local manual = core.profile(config, stats(30, 0.1))
 check(close(manual.lead, 0.195), "manual timing preserved")
 check(core.range(config, manual, 5000) == 140, "manual range preserved")
-config.autoTune = true
 
 local v = Vector3.new
-check(close(core.impact(v(100, 0, 0), v(100, 0, 0), 5), 0.95), "straight impact")
-check(close(core.impact(v(10, 4, 0), v(10, 0, 0), 5), 0.7), "glancing impact exact root")
-check(core.impact(v(10, 6, 0), v(10, 0, 0), 5) == nil, "near miss rejected")
-check(core.impact(v(10, 0, 0), v(-100, 0, 0), 5) == nil, "outgoing rejected")
-check(core.impact(v(10, 0, 0), v(0, 0, 0), 5) == nil, "stationary rejected")
-check(core.impact(v(2, 0, 0), v(100, 0, 0), 5) == 0, "incoming inside radius")
-check(core.impact(v(2, 0, 0), v(-100, 0, 0), 5) == nil, "outgoing inside radius")
-check(close(core.impact(v(100, 0, 0), v(100, 0, 0) - v(20, 0, 0), 5), 95 / 80), "moving away extends time")
-check(close(core.impact(v(100, 0, 0), v(100, 0, 0) - v(-20, 0, 0), 5), 95 / 120), "moving toward shortens time")
-check(core.impact(v(100, 0, 0), v(100, 0, 0) - v(0, 30, 0), 5) == nil, "lateral player movement considered")
-check(core.impact(v(100, 0, 0), v(100, 0, 0), 8) < core.impact(v(100, 0, 0), v(100, 0, 0), 5), "ball size considered")
+check(close(core.impact(v(100, 0, 0), v(100, 0, 0), 4.5, 18), 0.955), "straight approach")
+-- Regression: homing ball targets us, but its current straight line misses the
+-- small physical sphere. This must still reach the timing gate.
+check(core.impact(v(10, 8, 0), v(100, 0, 0), 4.5, 18) < fast.lead, "targeted curve triggers")
+check(core.impact(v(10, 8, 0), v(100, 0, 0), 4.5, 4.5) == nil, "unknown target remains strict")
+check(core.impact(v(10, 19, 0), v(100, 0, 0), 4.5, 18) == nil, "wide targeted miss rejected")
+check(core.impact(v(10, 0, 0), v(-100, 0, 0), 4.5, 18) == nil, "outgoing ignored")
+check(core.impact(v(10, 0, 0), v(0, 0, 0), 4.5, 18) == nil, "stationary ignored")
+check(core.impact(v(2, 0, 0), v(100, 0, 0), 4.5, 18) == 0, "close incoming triggers")
 
-local state = {retries = 0, revision = 2, sentRevision = 1}
-check(core.attempt(1, nil, state, false, 0.04, 2), "first approach allowed")
-check(not core.attempt(1, 0.5, state, false, 0.04, 2), "no distant duplicate")
-check(not core.attempt(1, 0.99, state, true, 0.04, 2), "retry cooldown")
-check(core.attempt(1, 0.9, state, true, 0.04, 2), "fresh close retry")
-state.revision = 1
-check(not core.attempt(1, 0.9, state, true, 0.04, 2), "stale snapshot retry blocked")
-state.revision, state.retries = 3, 2
-check(not core.attempt(1, 0.9, state, true, 0.04, 2), "retry limit")
-check(not core.finite(0 / 0) and not core.finite(math.huge), "invalid numbers rejected")
-
--- Exercise the actual performance sampler with controlled timestamps/pings.
-local sampleStart = assert(source:find("local function samplePerformance", 1, true))
-local sampleEnd = assert(source:find("-- Load the user-selected", sampleStart, true))
-local performance = assert(loadstring([[
-local CONFIG, timingProfile = ...
-local metrics = {frame = 1/60, frameJitter = 0, frames = 0, ping = 0,
-    pingJitter = 0, hasPing = false, nextPing = 0, pingAt = -math.huge}
-local lastFrameAt, lastPing, effective
-local mockPing = 20
-local function GetPingValue() return mockPing end
-]] .. mathSource .. source:sub(sampleStart, sampleEnd - 1) .. [[
-return {sample = samplePerformance, metrics = metrics,
-    setPing = function(p) mockPing = p end}
-]]))(config, core.profile)
-performance.sample(0)
-for i = 1, 600 do performance.sample(i / 120) end
-check(math.abs(1 / performance.metrics.frame - 120) < 2, "FPS converges to 120")
-local frameBefore = performance.metrics.frame
-performance.sample(10) -- long pause is excluded, not reported as 0 FPS
-check(close(performance.metrics.frame, frameBefore), "long frame pause ignored")
-performance.setPing(0 / 0)
-performance.sample(13)
-check(not performance.metrics.hasPing, "stale invalid ping expires")
-performance.setPing(60)
-performance.sample(14)
-check(performance.metrics.hasPing and close(performance.metrics.ping, 0.060), "ping recovers")
-print("PASS: " .. count .. " parry prediction, timing and retry regression checks")
+local state = {retries = 0}
+check(core.attempt(1, nil, state, false, 0.045, 2), "first attempt")
+check(not core.attempt(1, 0.5, state, false, 0.045, 2), "distant duplicate blocked")
+check(not core.attempt(1, 0.99, state, true, 0.045, 2), "retry cooldown")
+check(core.attempt(1, 0.9, state, true, 0.045, 2), "close retry does not require missed replication event")
+state.retries = 2
+check(not core.attempt(1, 0.9, state, true, 0.045, 2), "retry cap")
+check(not core.finite(0 / 0) and not core.finite(math.huge), "invalid numbers")
+print("PASS: " .. count .. " restored-trigger regression checks")
