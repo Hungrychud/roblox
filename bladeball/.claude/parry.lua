@@ -42,6 +42,9 @@ local parryCount = 0
 local guiVisible = true
 local drawings = {}
 local buttons = {}
+local mouse = player:GetMouse()
+local mouseWasDown = false
+local pointerOverGui = false
 
 -------------------------------------------------------------------------
 -- Matcha Drawing GUI
@@ -186,6 +189,28 @@ local function updateGui()
 end
 
 buildGui()
+
+-- Matcha InputBegan only supplies KeyCode. Poll its mouse API for clicks.
+local function updatePointer()
+	local x, y = mouse.X, mouse.Y
+	local active = type(isrbxactive) ~= "function" or isrbxactive()
+	pointerOverGui = active and guiVisible and GUI.ready and type(x) == "number" and type(y) == "number"
+		and x >= GUI.x and x <= GUI.x + GUI.w and y >= GUI.y and y <= GUI.y + 235
+	local down = type(ismouse1pressed) == "function" and ismouse1pressed() or false
+	if pointerOverGui then
+		for _, button in ipairs(buttons) do
+			local hover = x >= button.x and x <= button.x + button.w
+				and y >= button.y and y <= button.y + button.h
+			setDrawing(button.box, {Color = hover and Color3.fromRGB(55, 78, 100) or Color3.fromRGB(34, 39, 52)})
+			if hover and down and not mouseWasDown then button.action() end
+		end
+	else
+		for _, button in ipairs(buttons) do
+			setDrawing(button.box, {Color = Color3.fromRGB(34, 39, 52)})
+		end
+	end
+	mouseWasDown = down
+end
 
 local function safeAttribute(instance, name)
 	local ok, value = pcall(function()
@@ -367,6 +392,7 @@ end
 
 local function update()
 	if not running then return end
+	updatePointer()
 
 	local root = getRoot()
 	if not root then
@@ -381,7 +407,7 @@ local function update()
 	currentThreat = threat
 	lastPing = pingSeconds()
 	updateGui()
-	if not CONFIG.enabled or not threat then return end
+	if not CONFIG.enabled or not threat or pointerOverGui then return end
 
 	local pingLead = CONFIG.pingComp and lastPing * CONFIG.pingFactor or 0
 	local lead = math.min(CONFIG.maxLead, CONFIG.baseLead + pingLead)
@@ -431,19 +457,6 @@ if inputOk and inputSignal then
 			updateGui()
 		end
 
-		local mouseOk, inputType, position = pcall(function()
-			return input.UserInputType, input.Position
-		end)
-		if mouseOk and inputType == Enum.UserInputType.MouseButton1 and guiVisible and position then
-			for _, button in ipairs(buttons) do
-				if position.X >= button.x and position.X <= button.x + button.w
-					and position.Y >= button.y and position.Y <= button.y + button.h then
-					button.action()
-					updateGui()
-					break
-				end
-			end
-		end
 	end)
 end
 
