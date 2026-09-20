@@ -6,7 +6,7 @@ local first = assert(source:find("-- BEGIN PARRY MATH", 1, true))
 local last = assert(source:find("-- END PARRY MATH", first, true))
 local mathSource = source:sub(first, last - 1)
 local core = assert(loadstring(mathSource .. [[
-return {eligible = eligibleBall, intercept = interceptionDistance, profile = timingProfile, range = detectionRange, impact = impactTime,
+return {advance = advanceApproach, eligible = eligibleBall, intercept = interceptionDistance, profile = timingProfile, range = detectionRange, impact = impactTime,
     attempt = canAttempt, finite = finite}
 ]]))()
 local count = 0
@@ -81,4 +81,18 @@ check(not core.eligible(config, true, false, false), "target restriction can be 
 check(core.eligible(config, true, true, false), "own targeted ball retained")
 config.fallback = true
 check(core.eligible(config, true, false, true), "unknown-target fallback retained")
+-- Post-parry target updates and velocity flicker must not clear the shot lock.
+local shot = {locked = true, lastDistance = 12, retries = 0, target = "self"}
+shot.target = "other"
+check(not core.advance(shot, 100, 11), "target change with old incoming velocity stays locked")
+check(not core.attempt(1, 0.5, shot, false, 0.045, 2), "retries OFF blocks duplicate after target change")
+check(not core.advance(shot, -100, 11.1), "single outgoing velocity sample insufficient")
+check(not core.advance(shot, 100, 11), "velocity flicker does not rearm")
+check(not core.advance(shot, 0, 11), "zero velocity does not rearm")
+check(not core.advance(shot, -100, 11.2), "small outward movement keeps lock")
+check(not core.advance(shot, -100, 11.7) and shot.departed, "confirmed departure still keeps lock")
+check(not core.attempt(1, 0.5, shot, true, 0.045, 2), "confirmed outgoing ball cannot retry even with retries ON")
+check(core.advance(shot, 100, 11.4), "fresh inward approach after departure rearms")
+check(not shot.locked and shot.retries == 0, "new approach resets retry budget")
+check(not core.advance(shot, 100, 10), "same new approach cannot rearm twice")
 print("PASS: " .. count .. " parry regression checks")

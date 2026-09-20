@@ -11,6 +11,10 @@ local player = Players.LocalPlayer
 assert(player, "LocalPlayer is unavailable; run this as a client script")
 
 local restoreMinimized = false
+local restoreClash = nil
+if type(WabiSabi) == "table" and WabiSabi.Options and WabiSabi.Options.Clash then
+	restoreClash = WabiSabi.Options.Clash.Value
+end
 if _G.BB_MATCHA_STATUS then
 	local previousStatus = _G.BB_MATCHA_STATUS()
 	restoreMinimized = previousStatus and previousStatus.menuOpen == false
@@ -47,6 +51,7 @@ local CONFIG = {
 	maxClashRetries = 2,
 	fallback = true,
 }
+if type(restoreClash) == "boolean" then CONFIG.clashEnabled = restoreClash end
 
 local running = true
 local lastClick = -math.huge
@@ -111,8 +116,31 @@ end
 
 local function canAttempt(now, previous, state, isClash, retryDelay, limit)
 	if previous == nil then return true end
-	return isClash and now - previous >= retryDelay
+	return not state.departed and isClash and now - previous >= retryDelay
 		and (state.retries or 0) < limit
+end
+
+local function advanceApproach(state, closing, distance)
+	-- A target change is not a rebound: target and velocity can replicate on
+	-- different frames. Keep the shot lock until actual outward travel, then
+	-- a fresh inward phase. Require displacement to reject velocity flicker.
+	local rearmed = false
+	if state.locked then
+		if closing < -2 then
+			state.departureStart = state.departureStart or state.lastDistance or distance
+			if distance - state.departureStart >= 0.5 then state.departed = true end
+		elseif closing > 2 then
+			if state.departed then
+				state.locked, state.departed, state.departureStart = false, false, nil
+				state.retries = 0
+				rearmed = true
+			else
+				state.departureStart = nil
+			end
+		end
+	end
+	state.lastDistance = distance
+	return rearmed
 end
 
 local function interceptionDistance(config, profile, closing, acceleration)
@@ -500,7 +528,8 @@ local function ballKey(ball)
 		return ball.object.Address
 	end)
 	if ok and address ~= nil then return address end
-	return ball.object
+	-- Matcha creates new wrapper objects on reads; never hash the wrapper.
+	return ball.object:GetFullName()
 end
 
 local function fireParry()
@@ -528,13 +557,13 @@ local function chooseThreat(root, now)
 			if not state then state = {retries = 0}; tracked[key] = state end
 			state.seen = now
 			if state.target ~= ball.target then
-				firedAt[key], state.retries = nil, 0
 				state.acceleration, state.closing, state.sampleAt, state.velocity = 0, nil, nil, nil
 				state.target = ball.target
 			end
 			local offset = root.Position - ball.position
 			local distance = offset.Magnitude
 			local closing = distance > 0.001 and ball.velocity:Dot(offset / distance) or 0
+			if advanceApproach(state, closing, distance) then firedAt[key] = nil end
 			local dt = state.sampleAt and now - state.sampleAt or 0
 			local stable = state.velocity and state.velocity.Magnitude > 0
 				and ball.velocity.Unit:Dot(state.velocity.Unit) > 0.95
@@ -543,9 +572,6 @@ local function chooseThreat(root, now)
 				state.acceleration = (state.acceleration or 0) * 0.75 + gain * 0.25
 			else state.acceleration = 0 end
 			state.closing, state.sampleAt, state.velocity = closing, now, ball.velocity
-			if distance > 0.001 and closing <= 0 then
-				firedAt[key], state.retries = nil, 0
-			end
 			local aimed = ball.target == player.Name
 			local unknown = ball.target == nil or ball.target == ""
 			local eligible = eligibleBall(CONFIG, ball.real, aimed, unknown)
@@ -611,6 +637,9 @@ local function update()
 	if not canAttempt(now, previous, state, clash, effective.retry, CONFIG.maxClashRetries) then return end
 	if fireParry() then
 		if previous then state.retries = (state.retries or 0) + 1 end
+		state.locked = true
+		state.departed, state.departureStart = false, nil
+		state.lastDistance = threat.distance
 		lastClick, firedAt[key] = now, now
 		parryCount = parryCount + 1
 		lastFireDistance = threat.distance
@@ -634,6 +663,7 @@ end
 -- Read-only diagnostics for checking the active configuration in Matcha.
 _G.BB_MATCHA_STATUS = function()
 	return {automatic = CONFIG.autoTune, enabled = CONFIG.enabled, menuOpen = menuOpen,
+		closeRangeRetries = CONFIG.clashEnabled,
 		fps = 1 / metrics.frame, pingMs = metrics.hasPing and metrics.ping * 1000 or nil,
 		leadMs = effective.lead * 1000, retryMs = effective.retry * 1000,
 		clashRange = effective.clashRange, attempts = parryCount,
