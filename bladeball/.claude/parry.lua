@@ -86,6 +86,11 @@ local CONFIG = {
 	-- ---- Blatant ----
 	orbitBall = false, orbitKey = "H", orbitRadius = 8, orbitSpeed = 3,
 	immortality = false,
+
+	-- ---- Accuracy engine (outside-the-box) ----
+	adaptiveLearning = true,   -- self-tune the lead from real ServerParryCount outcomes
+	velocityBlend = true,      -- never under-estimate ball speed (positional derivative)
+	maxLearnBias = 0.06,       -- ceiling on how much earlier learning may fire (s)
 }
 if type(restoreClash) == "boolean" then CONFIG.clashEnabled = restoreClash end
 
@@ -127,6 +132,14 @@ local heldKeys = {}                  -- keyboard state for hold-to-spam / orbit
 local orbitAngle = 0
 local baseGravity = nil              -- restore workspace gravity on unload
 local playerNames = {"None"}         -- Target Player dropdown options
+
+-- ---- Closed-loop learning state (ServerParryCount feedback) ----
+local learnedBias = 0                -- extra lead learned from live outcomes (s)
+local pendingFires = {}              -- {t} one entry per fresh committed parry
+local lastParryCountSeen = nil       -- previous character ServerParryCount
+local parryMissEma = 0               -- 0 = landing everything, higher = missing
+local lastBiasAdjust = 0
+local lastLandDistance = nil         -- ball distance when a parry last confirmed
 
 -- BEGIN PARRY MATH (pure functions, also exercised by the regression checks)
 local function finite(n)
@@ -247,6 +260,11 @@ local function samplePerformance(now)
 	end
 	lastPing = metrics.ping
 	effective = timingProfile(CONFIG, metrics)
+	-- Fold in the empirically-learned bias (fire earlier when live outcomes show
+	-- we were late). Never drops below a 20 ms floor.
+	if CONFIG.adaptiveLearning and learnedBias > 0 then
+		effective.lead = math.clamp(effective.lead + learnedBias, 0.02, CONFIG.maxLead + CONFIG.maxLearnBias)
+	end
 end
 
 -- Load the user-selected Matcha UI library.
@@ -509,6 +527,18 @@ Timing:AddToggle({
 	Id = "AutoTune", Title = "Automatic tuning", Default = CONFIG.autoTune,
 	Callback = function(value) CONFIG.autoTune = value end,
 })
+Timing:AddSection("Adaptive accuracy engine")
+Timing:AddToggle({Id = "AdaptiveLearning", Title = "Adaptive learning (ServerParryCount)",
+	Default = CONFIG.adaptiveLearning,
+	Description = "Learns the exact lead from confirmed parries and fires earlier only when it detects late hits.",
+	Callback = function(value)
+		CONFIG.adaptiveLearning = value
+		if not value then learnedBias, parryMissEma, pendingFires = 0, 0, {} end
+	end})
+Timing:AddToggle({Id = "VelocityBlend", Title = "Velocity blend (anti-late)",
+	Default = CONFIG.velocityBlend,
+	Description = "Uses measured ball displacement so an under-reported velocity never triggers late.",
+	Callback = function(value) CONFIG.velocityBlend = value end})
 local TuningStatus = Timing:AddParagraph({Title = "Effective settings", Content = "Measuring ping and frame time..."})
 Timing:AddSection("Predictive distance (all modes)")
 Timing:AddToggle({Id = "EarlyParry", Title = "Earlier parry", Default = CONFIG.earlyParry,
@@ -561,9 +591,12 @@ local function updateGui()
 	Status:SetContent(string.format("%s | %s\nPing: %s | FPS estimate: %s | Attempts: %d", mode, threat, pingText, fpsText, parryCount))
 	local rangeText = currentThreat and string.format("%.0f studs", currentThreat.range)
 		or (CONFIG.autoTune and "140-500 studs, based on speed" or tostring(CONFIG.maxRange) .. " studs")
-	TuningStatus:SetContent(string.format("%s | Lead: %.0f ms | Retry: %.0f ms\nRange: %s | Close range: %.0f studs\nPing jitter: %.0f ms | Frame budget: %.1f ms",
+	local learnText = CONFIG.adaptiveLearning
+		and string.format("+%.0f ms (miss %.0f%%)", learnedBias * 1000, math.clamp(parryMissEma, 0, 1) * 100)
+		or "off"
+	TuningStatus:SetContent(string.format("%s | Lead: %.0f ms | Retry: %.0f ms\nRange: %s | Close range: %.0f studs\nPing jitter: %.0f ms | Frame budget: %.1f ms\nLearned bias: %s",
 		CONFIG.autoTune and "Automatic" or "Manual", effective.lead * 1000, effective.retry * 1000,
-		rangeText, effective.clashRange, metrics.pingJitter * 1000, effective.frame * 1000))
+		rangeText, effective.clashRange, metrics.pingJitter * 1000, effective.frame * 1000, learnText))
 end
 
 -- Fixed Drawing pool. Failure in the optional preview must not stop parrying.
@@ -810,6 +843,52 @@ local function nearestBallInfo(root)
 	return nil
 end
 
+-- =====================================================================
+-- Closed-loop lead calibration.
+-- The character's ServerParryCount rises once per server-confirmed parry.
+-- Each committed parry pushes a pending marker; a count increment resolves the
+-- oldest marker as a success, and a marker that ages out with no increment is a
+-- miss. A rising miss rate nudges the learned lead earlier (bounded); a clean
+-- streak lets it relax back. This tunes the timing to the live server + ping
+-- with no manual sliders.
+-- =====================================================================
+local function currentParryCount()
+	local ch = player.Character
+	if not ch then return nil end
+	local ok, v = pcall(function() return ch:GetAttribute("ServerParryCount") end)
+	if ok and type(v) == "number" then return v end
+	return nil
+end
+
+local function resolveLearning(now)
+	if not CONFIG.adaptiveLearning then return end
+	local count = currentParryCount()
+	if count and lastParryCountSeen and count > lastParryCountSeen then
+		for _ = 1, count - lastParryCountSeen do
+			if #pendingFires > 0 then
+				table.remove(pendingFires, 1)
+				lastLandDistance = currentThreat and currentThreat.distance or lastLandDistance
+			end
+			parryMissEma = parryMissEma * 0.7          -- confirmed hit
+		end
+	end
+	if count ~= nil then lastParryCountSeen = count end
+	for i = #pendingFires, 1, -1 do
+		if now - pendingFires[i].t > 0.5 then
+			table.remove(pendingFires, i)
+			parryMissEma = parryMissEma * 0.8 + 0.2    -- fire never confirmed = miss
+		end
+	end
+	if now - lastBiasAdjust > 0.3 then
+		lastBiasAdjust = now
+		if parryMissEma > 0.15 then
+			learnedBias = math.min(learnedBias + 0.004, CONFIG.maxLearnBias)
+		elseif learnedBias > 0 then
+			learnedBias = math.max(0, learnedBias - 0.002)
+		end
+	end
+end
+
 local function chooseThreat(root, now)
 	local folder = Workspace:FindFirstChild(CONFIG.ballsFolder)
 	if not folder then return nil end
@@ -827,22 +906,31 @@ local function chooseThreat(root, now)
 			end
 			local offset = root.Position - ball.position
 			local distance = offset.Magnitude
-			local closing = distance > 0.001 and ball.velocity:Dot(offset / distance) or 0
+			local toRoot = distance > 0.001 and offset / distance or Vector3.new(0, 0, 0)
+			local closing = distance > 0.001 and ball.velocity:Dot(toRoot) or 0
 			if advanceApproach(state, closing, distance) then firedAt[key] = nil end
 			local dt = state.sampleAt and now - state.sampleAt or 0
+			-- Velocity blend: derive closing speed from actual displacement and use
+			-- the larger of engine vs. measured, so an under-reported / stale
+			-- AssemblyLinearVelocity never makes us trigger late. Bounded to reject noise.
+			local effClosing = closing
+			if CONFIG.velocityBlend and state.lastPos and closing > 0 and dt >= 0.004 and dt <= 0.1 then
+				local dirClosing = (ball.position - state.lastPos):Dot(toRoot) / dt
+				if dirClosing > closing then effClosing = math.min(dirClosing, closing * 1.5) end
+			end
 			local stable = state.velocity and state.velocity.Magnitude > 0
 				and ball.velocity.Unit:Dot(state.velocity.Unit) > 0.95
 			if stable and state.closing and closing > 0 and dt >= 0.004 and dt <= 0.1 then
 				local gain = math.clamp((closing - state.closing) / dt, 0, closing * 2)
 				state.acceleration = (state.acceleration or 0) * 0.75 + gain * 0.25
 			else state.acceleration = 0 end
-			state.closing, state.sampleAt, state.velocity = closing, now, ball.velocity
+			state.closing, state.sampleAt, state.velocity, state.lastPos = closing, now, ball.velocity, ball.position
 			-- Target Player focuses assist parrying on someone else's incoming balls.
 			local focusName = (CONFIG.targetPlayer ~= "None" and CONFIG.targetPlayer) or player.Name
 			local aimed = ball.target == focusName
 			local unknown = ball.target == nil or ball.target == ""
 			local eligible = eligibleBall(CONFIG, ball.real, aimed, unknown)
-			local trigger = interceptionDistance(CONFIG, effective, closing, state.acceleration)
+			local trigger = interceptionDistance(CONFIG, effective, effClosing, state.acceleration)
 			local range = math.max(detectionRange(CONFIG, effective, ball.speed), trigger + 4)
 			if eligible and distance <= range then
 				local allowedMiss = aimed and CONFIG.targetedRadius or CONFIG.contactRadius
@@ -869,6 +957,7 @@ local function update(doSample)
 	-- Frame timing is measured on the render signal only; the extra Heartbeat
 	-- pass must not halve the measured frame time and shrink the safety margin.
 	if doSample ~= false then samplePerformance(now) end
+	if doSample ~= false then resolveLearning(now) end
 	if applyPlayerMods then pcall(applyPlayerMods) end
 	-- Cleanup also runs while idle, so removed balls don't accumulate.
 	if now - lastCleanup >= 1 then
@@ -882,6 +971,7 @@ local function update(doSample)
 	local rootId = root and root.Address
 	if rootId ~= activeRoot then
 		tracked, firedAt = {}, {}
+		pendingFires, lastParryCountSeen = {}, nil
 		activeRoot = rootId
 		lastClick = -math.huge
 	end
@@ -928,6 +1018,11 @@ local function update(doSample)
 		return
 	end
 	if fireParry() then
+		-- One learning marker per fresh committed shot (not per close-range retry),
+		-- so a single ServerParryCount increment maps to a single intended parry.
+		if not previous and CONFIG.adaptiveLearning then
+			pendingFires[#pendingFires + 1] = {t = now}
+		end
 		if previous then state.retries = (state.retries or 0) + 1 end
 		state.locked = true
 		state.departed, state.departureStart = false, nil
@@ -1266,7 +1361,9 @@ _G.BB_MATCHA_STATUS = function()
 		leadMs = effective.lead * 1000, retryMs = effective.retry * 1000,
 		clashRange = effective.clashRange, attempts = parryCount,
 		lastFireDistance = lastFireDistance, triggerDistance = currentThreat and currentThreat.triggerDistance,
-		extraDistance = CONFIG.earlyParry and CONFIG.extraDistance or 0}
+		extraDistance = CONFIG.earlyParry and CONFIG.extraDistance or 0,
+		adaptiveLearning = CONFIG.adaptiveLearning, learnedBiasMs = learnedBias * 1000,
+		missRate = parryMissEma, serverParryCount = lastParryCountSeen}
 end
 
 Library:OnUnload(function()
