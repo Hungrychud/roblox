@@ -728,14 +728,10 @@ local function ballKey(ball)
 	return ball.object:GetFullName()
 end
 
-local parryButton = remote("ParryButtonPress")
 local function fireParry()
-	-- Remote mode fires the game's own parry-button BindableEvent; every parry
-	-- handler listens to it, so it is the input-independent path.
-	if CONFIG.parryMode == "Remote" and parryButton then
-		local ok = pcall(function() parryButton:Fire() end)
-		if ok then return true end
-	end
+	-- Matcha does not allow :Fire() on the game's BindableEvents, so both parry
+	-- modes go through the real left-click path (the game turns MouseButton1 into
+	-- ParryAttempt itself). The dropdown is kept for non-Matcha executors.
 	local click = mouse1click
 	if type(click) ~= "function" then
 		click = mouse2click
@@ -761,12 +757,18 @@ local function passesAccuracy()
 	return math.random(1, 100) <= acc
 end
 
--- ---- Ability / emote / spam helpers ----
-local abilityPress = remote("AbilityButtonPress")
-local secondaryPress = remote("SecondaryAbilityButtonPress")
+-- ---- Ability helper ----
+-- Matcha cannot :Fire() the AbilityButtonPress BindableEvent, so trigger the
+-- equipped ability by simulating its keybind via keypress/keyrelease.
+-- Virtual key codes: 0x51 = Q (primary ability), 0x46 = F (secondary).
+local ABILITY_VK, SECONDARY_VK = 0x51, 0x46
 local function useAbility(secondary)
-	local ev = secondary and secondaryPress or abilityPress
-	if ev then pcall(function() ev:Fire() end) end
+	if type(keypress) ~= "function" then return end
+	local vk = secondary and SECONDARY_VK or ABILITY_VK
+	pcall(function()
+		keypress(vk)
+		task.delay(0.03, function() pcall(keyrelease, vk) end)
+	end)
 end
 
 -- Nearest incoming real ball root-distance, used by proximity features.
