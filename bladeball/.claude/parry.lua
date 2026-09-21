@@ -26,10 +26,10 @@ end
 
 local CONFIG = {
 	enabled = true,
-	-- Only parry the ball actually aimed at you. In FFA every player has a ball;
-	-- firing at other players' balls burns your parry cooldown so your own ball
-	-- arrives while you are locked out. Turn on only for single-ball modes.
-	anyIncoming = false,
+	-- Parry any real ball on a collision course with you. The `target` tag is not
+	-- reliable for the local player in every mode, so gating on target==you alone
+	-- can miss your own ball; geometric detection (impactTime) is the safety net.
+	anyIncoming = true,
 	autoTune = true,
 	earlyParry = true,
 	extraDistance = 4,
