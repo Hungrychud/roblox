@@ -48,8 +48,8 @@ local CONFIG = {
 	minInterval = 0.05,
 	clashEnabled = true,
 	clashInterval = 0.016,
-	clashRange = 22,
-	clashMinSpeed = 70,
+	clashRange = 14,          -- genuine point-blank only (was 22; fixed, not auto-expanded)
+	clashMinSpeed = 110,      -- real fast exchange (was 70)
 	clashRetry = 0.045,
 	maxClashRetries = 2,
 	fallback = true,
@@ -744,6 +744,15 @@ local function readBall(object)
 		target = safeAttribute(part, "target") or safeAttribute(part, "Target")
 	end
 
+	-- FakeoutRange is the game's own threat radius for a ball NOT tagged to you:
+	-- BallReplicationHandler highlights it as dangerous only within this range.
+	-- Mirroring it lets us parry a ball juking toward us while ignoring balls
+	-- that merely pass nearby on their way to someone else.
+	local fakeoutRange = safeAttribute(object, "FakeoutRange")
+	if fakeoutRange == nil and object ~= part then
+		fakeoutRange = safeAttribute(part, "FakeoutRange")
+	end
+
 	return {
 		object = object,
 		part = part,
@@ -752,6 +761,7 @@ local function readBall(object)
 		speed = speed,
 		target = target,
 		real = realBall,
+		fakeoutRange = type(fakeoutRange) == "number" and fakeoutRange or nil,
 	}
 end
 
@@ -932,17 +942,34 @@ local function chooseThreat(root, now)
 			local focusName = (CONFIG.targetPlayer ~= "None" and CONFIG.targetPlayer) or player.Name
 			local aimed = ball.target == focusName
 			local unknown = ball.target == nil or ball.target == ""
-			local eligible = eligibleBall(CONFIG, ball.real, aimed, unknown)
+			-- Priority mirrors the game's own threat model. The ball actually meant
+			-- for YOU (aimed, or a fakeout inside its FakeoutRange, or untagged) must
+			-- always beat a ball merely passing by on its way to someone else. This
+			-- is what stops the cooldown-burn that loses fast rallies: we never spend
+			-- the parry on a stray ball while our real one is inbound.
+			local fakeout = (not aimed) and ball.fakeoutRange ~= nil and distance <= ball.fakeoutRange
+			local priority
+			if aimed then priority = 3
+			elseif fakeout then priority = 2
+			elseif unknown then priority = 1
+			elseif CONFIG.anyIncoming then priority = 0   -- stray ball, geometric safety net only
+			else priority = -1 end
+			local eligible = ball.real ~= false and priority >= 0
 			local trigger = interceptionDistance(CONFIG, effective, effClosing, state.acceleration)
 			local range = math.max(detectionRange(CONFIG, effective, ball.speed), trigger + 4)
 			if eligible and distance <= range then
-				local allowedMiss = aimed and CONFIG.targetedRadius or CONFIG.contactRadius
+				-- Your ball gets the lenient targeted radius; a stray ball must be on a
+				-- genuine collision course with your hitbox before it counts.
+				local allowedMiss = (priority >= 2) and CONFIG.targetedRadius or CONFIG.contactRadius
 				local tti = impactTime(offset, ball.velocity, CONFIG.contactRadius, allowedMiss)
-				local better = tti and (not best or (CONFIG.anyIncoming and tti < best.tti)
-					or (not CONFIG.anyIncoming and ((aimed and not best.aimed) or (aimed == best.aimed and tti < best.tti))))
-				if better then
-					ball.key, ball.state = key, state
-					best = {ball = ball, distance = distance, tti = tti, aimed = aimed, range = range, triggerDistance = trigger}
+				if tti then
+					local better = not best or priority > best.priority
+						or (priority == best.priority and tti < best.tti)
+					if better then
+						ball.key, ball.state = key, state
+						best = {ball = ball, distance = distance, tti = tti, aimed = aimed,
+							priority = priority, range = range, triggerDistance = trigger}
+					end
 				end
 			end
 		end
@@ -1005,7 +1032,11 @@ local function update(doSample)
 	-- Cooldown protection: keep a minimum gap after the previous parry.
 	if CONFIG.cooldownProtection and now - lastParryEnd < CONFIG.cooldownGap then return end
 
-	local clash = CONFIG.clashEnabled and (threat.aimed or CONFIG.anyIncoming) and threat.distance <= effective.clashRange
+	-- Close-range retries only for a genuine fast, point-blank exchange with YOUR
+	-- ball (priority >= 2). Uses the fixed clashRange, not the auto-expanded one,
+	-- so normal mid-range incoming balls do not trigger rapid re-fire.
+	local clash = CONFIG.clashEnabled and (threat.priority or 0) >= 2
+		and threat.distance <= CONFIG.clashRange
 		and threat.ball.speed >= CONFIG.clashMinSpeed
 	local interval = effective.interval
 	if clash then interval = CONFIG.clashInterval end
