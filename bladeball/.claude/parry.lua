@@ -26,7 +26,10 @@ end
 
 local CONFIG = {
 	enabled = true,
-	anyIncoming = true,
+	-- Only parry the ball actually aimed at you. In FFA every player has a ball;
+	-- firing at other players' balls burns your parry cooldown so your own ball
+	-- arrives while you are locked out. Turn on only for single-ball modes.
+	anyIncoming = false,
 	autoTune = true,
 	earlyParry = true,
 	extraDistance = 4,
@@ -42,13 +45,13 @@ local CONFIG = {
 	pingComp = true,
 	pingFactor = 0.75,
 	maxLead = 0.42,
-	minInterval = 0.045,
+	minInterval = 0.05,
 	clashEnabled = true,
-	clashInterval = 0.014,
+	clashInterval = 0.016,
 	clashRange = 22,
 	clashMinSpeed = 70,
-	clashRetry = 0.038,
-	maxClashRetries = 3,
+	clashRetry = 0.045,
+	maxClashRetries = 2,
 	fallback = true,
 
 	-- ---- Combat additions ----
@@ -88,7 +91,7 @@ local CONFIG = {
 	immortality = false,
 
 	-- ---- Accuracy engine (outside-the-box) ----
-	adaptiveLearning = true,   -- self-tune the lead from real ServerParryCount outcomes
+	adaptiveLearning = false,  -- opt-in: self-tune lead from ServerParryCount outcomes
 	velocityBlend = true,      -- never under-estimate ball speed (positional derivative)
 	maxLearnBias = 0.06,       -- ceiling on how much earlier learning may fire (s)
 }
