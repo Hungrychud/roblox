@@ -50,6 +50,42 @@ local CONFIG = {
 	clashRetry = 0.045,
 	maxClashRetries = 2,
 	fallback = true,
+
+	-- ---- Combat additions ----
+	targetPlayer = "None",          -- only parry balls aimed at this player (assist)
+	parryMode = "Click",            -- "Click" (mouse1click) or "Remote" (ParryButtonPress)
+	accuracy = 100,                 -- % chance a valid parry opportunity is taken
+	randomizeAccuracy = false,      -- pick a random accuracy per attempt
+	randomAccMin = 50,
+	randomAccMax = 90,
+	manualSpam = false, manualSpamKey = "E", manualSpamInterval = 0.03,
+	autoSpam = false, autoSpamKey = "F2", autoSpamRange = 30, autoSpamInterval = 0.03,
+	killPreClick = false, preClickRange = 30, preClickBallSpeed = 1,
+	cooldownProtection = false, cooldownGap = 0.35,
+	autoAbility = false, autoAbilityRange = 25, autoAbilityInterval = 0.6, autoAbilitySecondary = false,
+	curveMode = "Off",              -- Off / Camera / Target
+	triggerbot = false, triggerbotKey = "None",
+
+	-- ---- Detections ----
+	ignoreInfinity = false, ignoreDeathSlash = false, ignoreSlashesOfFury = false, ignoreTimeHole = false,
+	antiPhantom = false, antiHellhook = false,
+
+	-- ---- Visuals additions ----
+	ballTrail = false, parryVisualizer = false, parryHits = false,
+	ballIndicator = false, abilityEsp = false, noRender = false,
+	customWinstreak = false, customWinstreakText = "Winstreak: %d",
+	customWinMessage = false, customWinMessageText = "GG",
+
+	-- ---- Player ----
+	fovEnabled = false, fov = 70,
+	gravityEnabled = false, gravity = 196.2,
+	speedEnabled = false, speed = 16,
+	jumpEnabled = false, jumpPower = 50,
+	infiniteJump = false,
+
+	-- ---- Blatant ----
+	orbitBall = false, orbitKey = "H", orbitRadius = 8, orbitSpeed = 3,
+	immortality = false,
 }
 if type(restoreClash) == "boolean" then CONFIG.clashEnabled = restoreClash end
 
@@ -69,6 +105,28 @@ local lastCleanup = 0
 local activeRoot = nil
 local metrics = {frame = 1 / 60, frameJitter = 0, frames = 0,
 	ping = 0, pingJitter = 0, hasPing = false, nextPing = 0, pingAt = -math.huge}
+
+-- ---- Live game remote references (Blade Ball, place 13772394625) ----
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = nil
+pcall(function() UserInputService = game:GetService("UserInputService") end)
+local Remotes = ReplicatedStorage:FindFirstChild("Remotes")
+local function remote(name)
+	return Remotes and Remotes:FindFirstChild(name) or nil
+end
+
+-- ---- Feature runtime state ----
+local lastSpam = -math.huge          -- manual/auto spam throttle
+local lastAbility = -math.huge       -- auto-ability throttle
+local lastParryEnd = -math.huge      -- for cooldown protection
+local lastEmote = -math.huge
+local detectionFlags = {infinity = 0, deathSlash = 0, slashesOfFury = 0, timeHole = 0} -- os.clock() when last seen
+local remoteConns = {}               -- detection remote connections
+local parryBurst = {}                -- {x, y, t0} drawing pulses for Parry Hits/Visualizer
+local heldKeys = {}                  -- keyboard state for hold-to-spam / orbit
+local orbitAngle = 0
+local baseGravity = nil              -- restore workspace gravity on unload
+local playerNames = {"None"}         -- Target Player dropdown options
 
 -- BEGIN PARRY MATH (pure functions, also exercised by the regression checks)
 local function finite(n)
@@ -272,12 +330,17 @@ local Window = Library:CreateWindow({
 	Theme = "Ocean",
 	MinimizeKey = "P",
 })
-local Main = Window:AddTab({Title = "Parry"})
+for _, plr in ipairs(Players:GetPlayers()) do
+	if plr ~= player then playerNames[#playerNames + 1] = plr.Name end
+end
+
+-- ======================= COMBAT =======================
+local Main = Window:AddTab({Title = "Combat"})
 Main:AddParagraph({
 	Title = "Match controls",
-	Content = "Drag the title bar to move. P minimizes the window; T toggles auto parry.\nAuto parry pauses while this window is open.",
+	Content = "Drag the title bar to move. P minimizes/plays; T toggles auto parry.\nAuto parry, spam and triggerbot pause while this window is open.",
 })
-local Controls = Main:AddSection("Features")
+local Controls = Main:AddSection("Auto Parry")
 Controls:AddToggle({
 	Id = "AutoParry", Title = "Auto parry", Default = CONFIG.enabled,
 	Keybind = {Default = "T", Mode = "Toggle"},
@@ -289,20 +352,158 @@ Controls:AddToggle({
 })
 Controls:AddToggle({
 	Id = "Clash", Title = "Close-range retries", Default = CONFIG.clashEnabled,
-	Description = "Allow bounded retries during fast, close exchanges.",
 	Callback = function(value) CONFIG.clashEnabled = value end,
 })
 Controls:AddToggle({
 	Id = "Fallback", Title = "Fallback targeting", Default = CONFIG.fallback,
-	Description = "Consider incoming real balls whose target is unknown.",
 	Callback = function(value) CONFIG.fallback = value end,
 })
 Controls:AddToggle({
 	Id = "Ping", Title = "Ping compensation", Default = CONFIG.pingComp,
 	Callback = function(value) CONFIG.pingComp = value end,
 })
+Controls:AddDropdown({
+	Title = "Parry mode", Options = {"Click", "Remote"}, Default = CONFIG.parryMode,
+	Callback = function(value) CONFIG.parryMode = value end,
+})
+Controls:AddSlider({
+	Title = "Accuracy (%)", Default = CONFIG.accuracy, Min = 0, Max = 100, Rounding = 0,
+	Callback = function(value) CONFIG.accuracy = value end,
+})
+Controls:AddToggle({
+	Title = "Randomize accuracy", Default = CONFIG.randomizeAccuracy,
+	Callback = function(value) CONFIG.randomizeAccuracy = value end,
+})
+Controls:AddSlider({
+	Title = "Random accuracy min", Default = CONFIG.randomAccMin, Min = 0, Max = 100, Rounding = 0,
+	Callback = function(value) CONFIG.randomAccMin = value end,
+})
+Controls:AddSlider({
+	Title = "Random accuracy max", Default = CONFIG.randomAccMax, Min = 0, Max = 100, Rounding = 0,
+	Callback = function(value) CONFIG.randomAccMax = value end,
+})
+
+local Target = Main:AddSection("Target Player")
+local targetDropdown = Target:AddDropdown({
+	Title = "Focus parry on player", Options = playerNames, Default = "None", Searchable = true,
+	Callback = function(value) CONFIG.targetPlayer = value end,
+})
+Target:AddButton({Title = "Refresh player list", Callback = function()
+	local names = {"None"}
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= player then names[#names + 1] = plr.Name end
+	end
+	playerNames = names
+	if targetDropdown and targetDropdown.SetValues then pcall(function() targetDropdown:SetValues(names) end) end
+end})
+
+local Spam = Main:AddSection("Spam")
+Spam:AddKeybind({
+	Title = "Manual spam", Default = CONFIG.manualSpamKey, Mode = "Toggle",
+	Callback = function(on) CONFIG.manualSpam = on end,
+})
+Spam:AddSlider({Title = "Manual spam interval (ms)", Default = CONFIG.manualSpamInterval * 1000,
+	Min = 10, Max = 200, Rounding = 0, Callback = function(v) CONFIG.manualSpamInterval = v / 1000 end})
+Spam:AddKeybind({
+	Title = "Auto spam (ball proximity)", Default = CONFIG.autoSpamKey, Mode = "Toggle",
+	Callback = function(on) CONFIG.autoSpam = on end,
+})
+Spam:AddSlider({Title = "Auto spam range (studs)", Default = CONFIG.autoSpamRange,
+	Min = 5, Max = 100, Rounding = 0, Callback = function(v) CONFIG.autoSpamRange = v end})
+
+local PreClick = Main:AddSection("Pre Click")
+PreClick:AddToggle({Title = "Kill pre click", Default = CONFIG.killPreClick,
+	Callback = function(v) CONFIG.killPreClick = v end})
+PreClick:AddSlider({Title = "Pre click range", Default = CONFIG.preClickRange,
+	Min = 5, Max = 120, Rounding = 0, Callback = function(v) CONFIG.preClickRange = v end})
+PreClick:AddSlider({Title = "Pre click ball speed", Default = CONFIG.preClickBallSpeed,
+	Min = 1, Max = 400, Rounding = 0, Callback = function(v) CONFIG.preClickBallSpeed = v end})
+
+local Abilities = Main:AddSection("Abilities & Extras")
+Abilities:AddToggle({Title = "Cooldown protection", Default = CONFIG.cooldownProtection,
+	Callback = function(v) CONFIG.cooldownProtection = v end})
+Abilities:AddToggle({Title = "Auto ability", Default = CONFIG.autoAbility,
+	Callback = function(v) CONFIG.autoAbility = v end})
+Abilities:AddToggle({Title = "Auto ability uses secondary", Default = CONFIG.autoAbilitySecondary,
+	Callback = function(v) CONFIG.autoAbilitySecondary = v end})
+Abilities:AddSlider({Title = "Auto ability range (studs)", Default = CONFIG.autoAbilityRange,
+	Min = 5, Max = 80, Rounding = 0, Callback = function(v) CONFIG.autoAbilityRange = v end})
+Abilities:AddDropdown({Title = "Curve mode", Options = {"Off", "Camera", "Target"}, Default = CONFIG.curveMode,
+	Callback = function(v) CONFIG.curveMode = v end})
+Abilities:AddKeybind({Title = "Triggerbot (ball targets you)", Default = CONFIG.triggerbotKey, Mode = "Toggle",
+	Callback = function(on) CONFIG.triggerbot = on end})
+
 local Status = Main:AddParagraph({Title = "Live status", Content = "Waiting for ball"})
 
+-- ======================= DETECTIONS =======================
+local Detect = Window:AddTab({Title = "Detections"})
+Detect:AddParagraph({Title = "Ability detection",
+	Content = "Ignore toggles stop auto parry from reacting to these special ability balls\n(their timing differs). Anti toggles notify you when an enemy uses one on you."})
+Detect:AddToggle({Title = "Infinity detection (ignore infinity ball)", Default = CONFIG.ignoreInfinity,
+	Callback = function(v) CONFIG.ignoreInfinity = v end})
+Detect:AddToggle({Title = "Death Slash detection (ignore)", Default = CONFIG.ignoreDeathSlash,
+	Callback = function(v) CONFIG.ignoreDeathSlash = v end})
+Detect:AddToggle({Title = "Slashes of Fury detection (ignore)", Default = CONFIG.ignoreSlashesOfFury,
+	Callback = function(v) CONFIG.ignoreSlashesOfFury = v end})
+Detect:AddToggle({Title = "Time Hole detection (ignore)", Default = CONFIG.ignoreTimeHole,
+	Callback = function(v) CONFIG.ignoreTimeHole = v end})
+Detect:AddToggle({Title = "Anti-Phantom (notify when targeted)", Default = CONFIG.antiPhantom,
+	Callback = function(v) CONFIG.antiPhantom = v end})
+Detect:AddToggle({Title = "Anti-Hellhook (notify when hooked)", Default = CONFIG.antiHellhook,
+	Callback = function(v) CONFIG.antiHellhook = v end})
+
+-- ======================= VISUALS =======================
+local Visuals = Window:AddTab({Title = "Visuals"})
+Visuals:AddToggle({Id = "Preview", Title = "Prediction preview", Default = CONFIG.predictionPreview,
+	Callback = function(value) CONFIG.predictionPreview = value end})
+Visuals:AddToggle({Id = "MatchHUD", Title = "Compact match HUD", Default = CONFIG.compactHud,
+	Callback = function(value) CONFIG.compactHud = value end})
+Visuals:AddToggle({Title = "Ball trail", Default = CONFIG.ballTrail,
+	Callback = function(v) CONFIG.ballTrail = v end})
+Visuals:AddToggle({Title = "Ball indicator (off-screen arrow)", Default = CONFIG.ballIndicator,
+	Callback = function(v) CONFIG.ballIndicator = v end})
+Visuals:AddToggle({Title = "Parry visualizer (ring on parry)", Default = CONFIG.parryVisualizer,
+	Callback = function(v) CONFIG.parryVisualizer = v end})
+Visuals:AddToggle({Title = "Parry hits (burst on parry)", Default = CONFIG.parryHits,
+	Callback = function(v) CONFIG.parryHits = v end})
+Visuals:AddToggle({Title = "Ability ESP", Default = CONFIG.abilityEsp,
+	Callback = function(v) CONFIG.abilityEsp = v end})
+Visuals:AddToggle({Title = "Custom winstreak HUD", Default = CONFIG.customWinstreak,
+	Callback = function(v) CONFIG.customWinstreak = v end})
+Visuals:AddInput({Title = "Winstreak text ( %d = count )", Default = CONFIG.customWinstreakText,
+	Callback = function(v) CONFIG.customWinstreakText = v end})
+
+-- ======================= PLAYER =======================
+local PlayerTab = Window:AddTab({Title = "Player"})
+PlayerTab:AddToggle({Title = "Field of view", Default = CONFIG.fovEnabled,
+	Callback = function(v) CONFIG.fovEnabled = v end})
+PlayerTab:AddSlider({Title = "FOV", Default = CONFIG.fov, Min = 30, Max = 120, Rounding = 0,
+	Callback = function(v) CONFIG.fov = v end})
+PlayerTab:AddToggle({Title = "Gravity", Default = CONFIG.gravityEnabled,
+	Callback = function(v) CONFIG.gravityEnabled = v end})
+PlayerTab:AddSlider({Title = "Gravity value", Default = CONFIG.gravity, Min = 0, Max = 400, Rounding = 0,
+	Callback = function(v) CONFIG.gravity = v end})
+PlayerTab:AddToggle({Title = "Speed", Default = CONFIG.speedEnabled,
+	Callback = function(v) CONFIG.speedEnabled = v end})
+PlayerTab:AddSlider({Title = "Walk speed", Default = CONFIG.speed, Min = 0, Max = 120, Rounding = 0,
+	Callback = function(v) CONFIG.speed = v end})
+PlayerTab:AddToggle({Title = "Jump power", Default = CONFIG.jumpEnabled,
+	Callback = function(v) CONFIG.jumpEnabled = v end})
+PlayerTab:AddSlider({Title = "Jump power value", Default = CONFIG.jumpPower, Min = 0, Max = 300, Rounding = 0,
+	Callback = function(v) CONFIG.jumpPower = v end})
+PlayerTab:AddKeybind({Title = "Infinite jump", Default = "None", Mode = "Toggle",
+	Callback = function(on) CONFIG.infiniteJump = on end})
+
+-- ======================= BLATANT =======================
+local Blatant = Window:AddTab({Title = "Blatant"})
+Blatant:AddKeybind({Title = "Orbit ball", Default = CONFIG.orbitKey, Mode = "Toggle",
+	Callback = function(on) CONFIG.orbitBall = on end})
+Blatant:AddSlider({Title = "Orbit radius", Default = CONFIG.orbitRadius, Min = 3, Max = 30, Rounding = 0,
+	Callback = function(v) CONFIG.orbitRadius = v end})
+Blatant:AddSlider({Title = "Orbit speed", Default = CONFIG.orbitSpeed, Min = 1, Max = 12, Rounding = 1,
+	Callback = function(v) CONFIG.orbitSpeed = v end})
+
+-- ======================= TIMING =======================
 local Timing = Window:AddTab({Title = "Timing"})
 Timing:AddToggle({
 	Id = "AutoTune", Title = "Automatic tuning", Default = CONFIG.autoTune,
@@ -333,13 +534,8 @@ Timing:AddSlider({
 	Callback = function(value) CONFIG.clashRange = value end,
 })
 
-local Visuals = Window:AddTab({Title = "Visuals"})
-Visuals:AddToggle({Id = "Preview", Title = "Prediction preview", Default = CONFIG.predictionPreview,
-	Callback = function(value) CONFIG.predictionPreview = value end})
-Visuals:AddToggle({Id = "MatchHUD", Title = "Compact match HUD", Default = CONFIG.compactHud,
-	Callback = function(value) CONFIG.compactHud = value end})
-
-local Interface = Window:AddTab({Title = "Interface"})
+-- ======================= GUI =======================
+local Interface = Window:AddTab({Title = "GUI"})
 Interface:AddDropdown({
 	Title = "Theme", Options = {"Ocean", "Dark", "Aqua", "Amethyst", "Rose", "Darker"},
 	Default = "Ocean", Callback = function(value) Library:SetTheme(value) end,
@@ -532,7 +728,14 @@ local function ballKey(ball)
 	return ball.object:GetFullName()
 end
 
+local parryButton = remote("ParryButtonPress")
 local function fireParry()
+	-- Remote mode fires the game's own parry-button BindableEvent; every parry
+	-- handler listens to it, so it is the input-independent path.
+	if CONFIG.parryMode == "Remote" and parryButton then
+		local ok = pcall(function() parryButton:Fire() end)
+		if ok then return true end
+	end
 	local click = mouse1click
 	if type(click) ~= "function" then
 		click = mouse2click
@@ -543,6 +746,43 @@ local function fireParry()
 	end
 	local ok, result = pcall(click)
 	return ok and result ~= false
+end
+
+-- Accuracy gate: rolls the configured (or randomized) accuracy percentage.
+local function passesAccuracy()
+	local acc = CONFIG.accuracy
+	if CONFIG.randomizeAccuracy then
+		local lo, hi = CONFIG.randomAccMin, CONFIG.randomAccMax
+		if lo > hi then lo, hi = hi, lo end
+		acc = math.random(math.floor(lo), math.floor(hi))
+	end
+	if acc >= 100 then return true end
+	if acc <= 0 then return false end
+	return math.random(1, 100) <= acc
+end
+
+-- ---- Ability / emote / spam helpers ----
+local abilityPress = remote("AbilityButtonPress")
+local secondaryPress = remote("SecondaryAbilityButtonPress")
+local function useAbility(secondary)
+	local ev = secondary and secondaryPress or abilityPress
+	if ev then pcall(function() ev:Fire() end) end
+end
+
+-- Nearest incoming real ball root-distance, used by proximity features.
+local function nearestBallInfo(root)
+	local folder = Workspace:FindFirstChild(CONFIG.ballsFolder)
+	if not folder or not root then return nil end
+	local best, bestDist = nil, math.huge
+	for _, object in ipairs(folder:GetChildren()) do
+		local ball = readBall(object)
+		if ball and ball.real ~= false then
+			local d = (root.Position - ball.position).Magnitude
+			if d < bestDist then best, bestDist = ball, d end
+		end
+	end
+	if best then return best, bestDist end
+	return nil
 end
 
 local function chooseThreat(root, now)
@@ -572,7 +812,9 @@ local function chooseThreat(root, now)
 				state.acceleration = (state.acceleration or 0) * 0.75 + gain * 0.25
 			else state.acceleration = 0 end
 			state.closing, state.sampleAt, state.velocity = closing, now, ball.velocity
-			local aimed = ball.target == player.Name
+			-- Target Player focuses assist parrying on someone else's incoming balls.
+			local focusName = (CONFIG.targetPlayer ~= "None" and CONFIG.targetPlayer) or player.Name
+			local aimed = ball.target == focusName
 			local unknown = ball.target == nil or ball.target == ""
 			local eligible = eligibleBall(CONFIG, ball.real, aimed, unknown)
 			local trigger = interceptionDistance(CONFIG, effective, closing, state.acceleration)
@@ -592,10 +834,15 @@ local function chooseThreat(root, now)
 	return best
 end
 
+-- Forward declarations so update() (defined first) can call the feature
+-- helpers, whose bodies are defined further below.
+local applyPlayerMods, runFeatures, drawFeatureFx, spawnBurst, ballIgnored, curveBall
+
 local function update()
 	if not running then return end
 	local now = tick()
 	samplePerformance(now)
+	if applyPlayerMods then pcall(applyPlayerMods) end
 	-- Cleanup also runs while idle, so removed balls don't accumulate.
 	if now - lastCleanup >= 1 then
 		lastCleanup = now
@@ -622,9 +869,21 @@ local function update()
 	currentThreat = threat
 	updateGui()
 	updatePreview(root, threat)
+	if drawFeatureFx then pcall(drawFeatureFx, root, threat) end
+	if runFeatures then pcall(runFeatures, now, root, threat) end
 	if not CONFIG.enabled or not threat or menuOpen then return end
-	if threat.distance > threat.triggerDistance then return end
+	if ballIgnored and ballIgnored(threat.ball) then return end
+	if threat.distance > threat.triggerDistance then
+		-- Kill pre click: allow one early blind click on a fast, nearby ball.
+		if CONFIG.killPreClick and threat.ball.speed >= CONFIG.preClickBallSpeed
+			and threat.distance <= CONFIG.preClickRange and now - lastClick >= effective.interval then
+			if passesAccuracy() and fireParry() then lastClick = now; spawnBurst(threat.ball.position) end
+		end
+		return
+	end
 	if type(isrbxactive) == "function" and not isrbxactive() then return end
+	-- Cooldown protection: keep a minimum gap after the previous parry.
+	if CONFIG.cooldownProtection and now - lastParryEnd < CONFIG.cooldownGap then return end
 
 	local clash = CONFIG.clashEnabled and (threat.aimed or CONFIG.anyIncoming) and threat.distance <= effective.clashRange
 		and threat.ball.speed >= CONFIG.clashMinSpeed
@@ -635,14 +894,299 @@ local function update()
 	local key, state = threat.ball.key, threat.ball.state
 	local previous = firedAt[key]
 	if not canAttempt(now, previous, state, clash, effective.retry, CONFIG.maxClashRetries) then return end
+	-- Accuracy: consume the shot on a miss roll so the percentage is meaningful.
+	if not passesAccuracy() then
+		lastClick, firedAt[key] = now, now
+		state.locked, state.departed, state.departureStart, state.lastDistance = true, false, nil, threat.distance
+		return
+	end
 	if fireParry() then
 		if previous then state.retries = (state.retries or 0) + 1 end
 		state.locked = true
 		state.departed, state.departureStart = false, nil
 		state.lastDistance = threat.distance
-		lastClick, firedAt[key] = now, now
+		lastClick, firedAt[key], lastParryEnd = now, now, now
 		parryCount = parryCount + 1
 		lastFireDistance = threat.distance
+		if curveBall then curveBall(threat.ball, root) end
+		if spawnBurst then spawnBurst(threat.ball.position) end
+	end
+end
+
+-- =====================================================================
+-- Extra feature overlays (Drawing pool; auto-removed on unload)
+-- =====================================================================
+local fx = {}
+fx.indicator = overlayObject("Triangle", {Filled = true, Transparency = 1, Color = Color3.fromRGB(255, 90, 90), ZIndex = 9})
+fx.winstreak = overlayObject("Text", {Size = 18, Font = 2, Outline = true, Center = true,
+	Position = Vector2.new(0, 0), Color = Color3.fromRGB(255, 220, 120), Transparency = 1, ZIndex = 11})
+local trailPoints = {}     -- recent ball screen positions
+local trailLines = {}
+for i = 1, 14 do
+	trailLines[i] = overlayObject("Line", {Thickness = 2, Transparency = 1, Color = Color3.fromRGB(120, 200, 255), ZIndex = 8})
+end
+local burstCircles = {}
+for i = 1, 6 do
+	burstCircles[i] = overlayObject("Circle", {NumSides = 28, Filled = false, Thickness = 2, Transparency = 0, ZIndex = 11})
+end
+local espTexts = {}
+for i = 1, 12 do
+	espTexts[i] = overlayObject("Text", {Size = 13, Font = 2, Outline = true, Center = true, Transparency = 1,
+		Color = Color3.fromRGB(255, 255, 255), ZIndex = 9})
+end
+
+function spawnBurst(worldPos)
+	if not (CONFIG.parryHits or CONFIG.parryVisualizer) then return end
+	parryBurst[#parryBurst + 1] = {pos = worldPos, t0 = os.clock()}
+	if #parryBurst > 6 then table.remove(parryBurst, 1) end
+end
+
+-- =====================================================================
+-- Detection listeners: notify on abilities used against the local player
+-- =====================================================================
+local function notify(title, text)
+	pcall(function() Library:Notify({Title = title, Content = text, Duration = 3}) end)
+end
+local function bindDetection(name, cfgKey, title, text)
+	local ev = remote(name)
+	if not ev or not ev.OnClientEvent then return end
+	local ok, conn = pcall(function()
+		return ev.OnClientEvent:Connect(function()
+			if CONFIG[cfgKey] then notify(title, text) end
+		end)
+	end)
+	if ok and conn then remoteConns[#remoteConns + 1] = conn end
+end
+bindDetection("Phantom", "antiPhantom", "Anti-Phantom", "A Phantom ability was used.")
+bindDetection("PlrHellHooked", "antiHellhook", "Anti-Hellhook", "You are being Hell Hooked!")
+
+-- Ignore special ability balls by name/attribute keyword so their off-timing
+-- does not bait a fatal auto-parry.
+function ballIgnored(ball)
+	local name = ""
+	pcall(function() name = tostring(ball.object.Name):lower() end)
+	if CONFIG.ignoreInfinity and name:find("infinit") then return true end
+	if CONFIG.ignoreDeathSlash and (name:find("death") or name:find("slash")) then return true end
+	if CONFIG.ignoreSlashesOfFury and name:find("fury") then return true end
+	if CONFIG.ignoreTimeHole then
+		if name:find("time") then return true end
+		if safeAttribute(ball.part, "IsInTimeHoleAOE") or safeAttribute(ball.object, "IsInTimeHoleAOE") then return true end
+	end
+	return false
+end
+
+-- =====================================================================
+-- Curve mode: point the parried ball at the camera aim or nearest enemy.
+-- =====================================================================
+local function setBallTarget(ball, name)
+	pcall(function() ball.object:SetAttribute("target", name) end)
+	pcall(function() ball.part:SetAttribute("target", name) end)
+end
+function curveBall(ball, root)
+	if CONFIG.curveMode == "Off" then return end
+	local cam = Workspace.CurrentCamera
+	local bestName, bestScore = nil, -math.huge
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= player and plr.Character then
+			local prt = plr.Character:FindFirstChild("HumanoidRootPart")
+			if prt then
+				local dir = prt.Position - ball.position
+				local score
+				if CONFIG.curveMode == "Camera" and cam then
+					score = cam.CFrame.LookVector:Dot(dir.Unit)  -- most aligned with view
+				else
+					score = -dir.Magnitude                        -- nearest enemy
+				end
+				if score > bestScore then bestScore, bestName = score, plr.Name end
+			end
+		end
+	end
+	if bestName then setBallTarget(ball, bestName) end
+end
+
+-- =====================================================================
+-- Player modifications (FOV / gravity / speed / jump / infinite jump)
+-- =====================================================================
+pcall(function() baseGravity = Workspace.Gravity end)
+function applyPlayerMods()
+	local cam = Workspace.CurrentCamera
+	if CONFIG.fovEnabled and cam then pcall(function() cam.FieldOfView = CONFIG.fov end) end
+	if CONFIG.gravityEnabled then pcall(function() Workspace.Gravity = CONFIG.gravity end)
+	elseif baseGravity then pcall(function() Workspace.Gravity = baseGravity end) end
+	local character = player.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if humanoid then
+		if CONFIG.speedEnabled then pcall(function() humanoid.WalkSpeed = CONFIG.speed end) end
+		if CONFIG.jumpEnabled then
+			pcall(function() humanoid.UseJumpPower = true end)
+			pcall(function() humanoid.JumpPower = CONFIG.jumpPower end)
+		end
+		if CONFIG.infiniteJump then
+			pcall(function()
+				if humanoid:GetState() == Enum.HumanoidStateType.Freefall then
+					humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+				end
+			end)
+		end
+	end
+end
+
+-- =====================================================================
+-- Orbit ball: sweep the character around the nearest ball each frame.
+-- =====================================================================
+local function orbitStep(now, root)
+	if not CONFIG.orbitBall or not root then return end
+	local ball = nearestBallInfo(root)
+	if not ball then return end
+	orbitAngle = orbitAngle + CONFIG.orbitSpeed * math.clamp(metrics.frame, 1/240, 0.05)
+	local r = CONFIG.orbitRadius
+	local target = ball.position + Vector3.new(math.cos(orbitAngle) * r, 0, math.sin(orbitAngle) * r)
+	pcall(function() root.CFrame = CFrame.new(target, ball.position) end)
+end
+
+-- =====================================================================
+-- Spam / triggerbot / auto-ability (run independently of the timed parry)
+-- =====================================================================
+function runFeatures(now, root, threat)
+	if menuOpen then return end
+	if type(isrbxactive) == "function" and not isrbxactive() then return end
+
+	-- Manual spam: blind parry at the configured rate while toggled on.
+	if CONFIG.manualSpam and now - lastSpam >= CONFIG.manualSpamInterval then
+		if fireParry() then lastSpam = now end
+	end
+	-- Auto spam: parry rapidly while a real ball sits inside the proximity ring.
+	if CONFIG.autoSpam and now - lastSpam >= CONFIG.autoSpamInterval then
+		local ball, dist = nearestBallInfo(root)
+		if ball and dist <= CONFIG.autoSpamRange then
+			if fireParry() then lastSpam = now; spawnBurst(ball.position) end
+		end
+	end
+	-- Triggerbot: instant parry the moment a real ball is aimed at you.
+	if CONFIG.triggerbot and threat and threat.aimed and now - lastClick >= effective.interval then
+		if fireParry() then lastClick = now; spawnBurst(threat.ball.position) end
+	end
+	-- Auto ability: fire the equipped ability when a ball closes in.
+	if CONFIG.autoAbility and now - lastAbility >= CONFIG.autoAbilityInterval then
+		local ball, dist = nearestBallInfo(root)
+		if ball and dist <= CONFIG.autoAbilityRange then
+			useAbility(CONFIG.autoAbilitySecondary)
+			lastAbility = now
+		end
+	end
+	orbitStep(now, root)
+end
+
+-- =====================================================================
+-- Feature overlays drawn each frame (trail, indicator, bursts, ESP, HUD).
+-- =====================================================================
+function drawFeatureFx(root, threat)
+	-- Ball trail
+	for _, l in ipairs(trailLines) do l.Visible = false end
+	if CONFIG.ballTrail and root and type(WorldToScreen) == "function" then
+		local ball = nearestBallInfo(root)
+		if ball then
+			local pt, vis = WorldToScreen(ball.position)
+			if vis then
+				table.insert(trailPoints, 1, pt)
+				while #trailPoints > #trailLines + 1 do table.remove(trailPoints) end
+			end
+		else trailPoints = {} end
+		for i = 1, #trailPoints - 1 do
+			local a, b, line = trailPoints[i], trailPoints[i + 1], trailLines[i]
+			if line then line.From = a; line.To = b; line.Transparency = 1 - (i / #trailLines) * 0.8; line.Visible = true end
+		end
+	else trailPoints = {} end
+
+	-- Off-screen / on-screen ball indicator arrow toward the nearest ball.
+	if fx.indicator then fx.indicator.Visible = false end
+	if CONFIG.ballIndicator and root and fx.indicator and type(WorldToScreen) == "function" then
+		local ball = nearestBallInfo(root)
+		local cam = Workspace.CurrentCamera
+		if ball and cam then
+			local vw, vh = 1920, 1080
+			pcall(function() local vp = cam.ViewportSize; vw, vh = vp.X, vp.Y end)
+			local cx, cy = vw / 2, vh / 2
+			local pt, vis = WorldToScreen(ball.position)
+			local dx, dy
+			if vis then dx, dy = pt.X - cx, pt.Y - cy else
+				local rel = cam.CFrame:PointToObjectSpace(ball.position)
+				dx, dy = rel.X, rel.Y ~= 0 and -rel.Y or 1
+			end
+			local mag = math.sqrt(dx * dx + dy * dy)
+			if mag > 1 then
+				dx, dy = dx / mag, dy / mag
+				local ex, ey = cx + dx * math.min(cx, cy) * 0.6, cy + dy * math.min(cx, cy) * 0.6
+				local px, py = -dy, dx
+				fx.indicator.PointA = Vector2.new(ex + dx * 18, ey + dy * 18)
+				fx.indicator.PointB = Vector2.new(ex - dx * 6 + px * 10, ey - dy * 6 + py * 10)
+				fx.indicator.PointC = Vector2.new(ex - dx * 6 - px * 10, ey - dy * 6 - py * 10)
+				fx.indicator.Visible = true
+			end
+		end
+	end
+
+	-- Parry bursts (Parry Hits / Visualizer)
+	local nowc = os.clock()
+	for _, c in ipairs(burstCircles) do c.Visible = false end
+	for i = #parryBurst, 1, -1 do
+		local b = parryBurst[i]
+		local age = nowc - b.t0
+		if age > 0.35 then table.remove(parryBurst, i)
+		elseif type(WorldToScreen) == "function" then
+			local pt, vis = WorldToScreen(b.pos)
+			local circle = burstCircles[i]
+			if vis and circle then
+				circle.Position = pt
+				circle.Radius = 12 + age * 160
+				circle.Transparency = 1 - age / 0.35
+				circle.Color = CONFIG.parryVisualizer and Color3.fromRGB(120, 220, 255) or Color3.fromRGB(255, 240, 120)
+				circle.Visible = true
+			end
+		end
+	end
+
+	-- Ability ESP: label the equipped (enabled) ability above each player.
+	for _, t in ipairs(espTexts) do t.Visible = false end
+	if CONFIG.abilityEsp and type(WorldToScreen) == "function" then
+		local slot = 0
+		for _, plr in ipairs(Players:GetPlayers()) do
+			if plr ~= player and plr.Character and slot < #espTexts then
+				local head = plr.Character:FindFirstChild("Head") or plr.Character:FindFirstChild("HumanoidRootPart")
+				local abilities = plr.Character:FindFirstChild("Abilities")
+				local abilityName
+				if abilities then
+					for _, a in ipairs(abilities:GetChildren()) do
+						local enabled = true
+						pcall(function() enabled = a.Enabled ~= false end)
+						if enabled and a.Name ~= "inf" then abilityName = a.Name; break end
+					end
+					abilityName = abilityName or (abilities:GetChildren()[1] and abilities:GetChildren()[1].Name)
+				end
+				if head and abilityName then
+					local pt, vis = WorldToScreen(head.Position)
+					if vis then
+						slot = slot + 1
+						local t = espTexts[slot]
+						t.Position = Vector2.new(pt.X, pt.Y - 40)
+						t.Text = plr.Name .. " [" .. abilityName .. "]"
+						t.Visible = true
+					end
+				end
+			end
+		end
+	end
+
+	-- Custom winstreak HUD
+	if fx.winstreak then fx.winstreak.Visible = false end
+	if CONFIG.customWinstreak and fx.winstreak then
+		local streak = 0
+		pcall(function() streak = tonumber(player:GetAttribute("Winstreak") or player:GetAttribute("WinStreak")) or 0 end)
+		local txt = CONFIG.customWinstreakText
+		local ok, formatted = pcall(string.format, txt, streak)
+		fx.winstreak.Text = ok and formatted or txt
+		fx.winstreak.Position = Vector2.new((Workspace.CurrentCamera and Workspace.CurrentCamera.ViewportSize.X or 1920) / 2, 90)
+		fx.winstreak.Visible = true
 	end
 end
 
@@ -653,6 +1197,8 @@ renderConnection = renderSignal:Connect(update)
 _G.BB_MATCHA_STOP = function()
 	running = false
 	if renderConnection then renderConnection:Disconnect() end
+	for _, conn in ipairs(remoteConns) do pcall(function() conn:Disconnect() end) end
+	if baseGravity then pcall(function() Workspace.Gravity = baseGravity end) end
 	Library:Stop()
 	for _, object in ipairs(overlayObjects) do pcall(function() object:Remove() end) end
 	firedAt = {}
