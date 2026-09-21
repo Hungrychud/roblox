@@ -42,13 +42,13 @@ local CONFIG = {
 	pingComp = true,
 	pingFactor = 0.75,
 	maxLead = 0.42,
-	minInterval = 0.055,
+	minInterval = 0.045,
 	clashEnabled = true,
-	clashInterval = 0.018,
+	clashInterval = 0.014,
 	clashRange = 22,
 	clashMinSpeed = 70,
-	clashRetry = 0.045,
-	maxClashRetries = 2,
+	clashRetry = 0.038,
+	maxClashRetries = 3,
 	fallback = true,
 
 	-- ---- Combat additions ----
@@ -759,12 +759,35 @@ end
 
 -- ---- Ability helper ----
 -- Matcha cannot :Fire() the AbilityButtonPress BindableEvent, so trigger the
--- equipped ability by simulating its keybind via keypress/keyrelease.
--- Virtual key codes: 0x51 = Q (primary ability), 0x46 = F (secondary).
-local ABILITY_VK, SECONDARY_VK = 0x51, 0x46
+-- equipped ability by simulating its keybind via keypress/keyrelease. The bound
+-- key is read live from the Hotbar hotkey label (single letters map straight to
+-- their virtual-key code: 'A'..'Z' == 0x41..0x5A). Falls back to E / X.
+local function charToVk(ch)
+	if type(ch) ~= "string" or #ch ~= 1 then return nil end
+	local up = ch:upper()
+	local b = string.byte(up)
+	if (b >= 65 and b <= 90) or (b >= 48 and b <= 57) then return b end
+	return nil
+end
+local function hotbarKeyVk(slot, fallback)
+	local ok, vk = pcall(function()
+		local hb = player.PlayerGui.Hotbar
+		local frame = hb:FindFirstChild(slot)
+		if not frame then return nil end
+		-- The hotkey display is a short TextLabel (named "Q"/"X" historically).
+		for _, d in ipairs(frame:GetDescendants()) do
+			if d:IsA("TextLabel") and type(d.Text) == "string" and #d.Text == 1 then
+				local v = charToVk(d.Text)
+				if v then return v end
+			end
+		end
+		return nil
+	end)
+	return (ok and vk) or fallback
+end
 local function useAbility(secondary)
 	if type(keypress) ~= "function" then return end
-	local vk = secondary and SECONDARY_VK or ABILITY_VK
+	local vk = secondary and hotbarKeyVk("SecondAbility", 0x58) or hotbarKeyVk("Ability", 0x45)
 	pcall(function()
 		keypress(vk)
 		task.delay(0.03, function() pcall(keyrelease, vk) end)
@@ -840,10 +863,12 @@ end
 -- helpers, whose bodies are defined further below.
 local applyPlayerMods, runFeatures, drawFeatureFx, spawnBurst, ballIgnored, curveBall
 
-local function update()
+local function update(doSample)
 	if not running then return end
 	local now = tick()
-	samplePerformance(now)
+	-- Frame timing is measured on the render signal only; the extra Heartbeat
+	-- pass must not halve the measured frame time and shrink the safety margin.
+	if doSample ~= false then samplePerformance(now) end
 	if applyPlayerMods then pcall(applyPlayerMods) end
 	-- Cleanup also runs while idle, so removed balls don't accumulate.
 	if now - lastCleanup >= 1 then
@@ -1183,7 +1208,23 @@ function drawFeatureFx(root, threat)
 	if fx.winstreak then fx.winstreak.Visible = false end
 	if CONFIG.customWinstreak and fx.winstreak then
 		local streak = 0
-		pcall(function() streak = tonumber(player:GetAttribute("Winstreak") or player:GetAttribute("WinStreak")) or 0 end)
+		-- Source: the character's WinStreakDisplay billboard text (real value),
+		-- with a player-attribute fallback.
+		pcall(function()
+			local ch = player.Character
+			local disp = ch and ch:FindFirstChild("WinStreakDisplay")
+			if disp then
+				for _, d in ipairs(disp:GetDescendants()) do
+					if d:IsA("TextLabel") then
+						local n = tostring(d.Text):match("%d+")
+						if n then streak = tonumber(n); break end
+					end
+				end
+			end
+			if streak == 0 then
+				streak = tonumber(player:GetAttribute("Winstreak") or player:GetAttribute("WinStreak")) or 0
+			end
+		end)
 		local txt = CONFIG.customWinstreakText
 		local ok, formatted = pcall(string.format, txt, streak)
 		fx.winstreak.Text = ok and formatted or txt
@@ -1194,11 +1235,20 @@ end
 
 local renderSignal = RunService.RenderStepped or RunService.Heartbeat
 assert(renderSignal, "Matcha exposes neither RenderStepped nor Heartbeat")
-renderConnection = renderSignal:Connect(update)
+renderConnection = renderSignal:Connect(function() update(true) end)
+-- Second, post-physics pass: Heartbeat runs after the ball's velocity/position
+-- have been integrated, so a fast incoming ball is detected and parried a
+-- fraction earlier than waiting for the next render frame. Perf sampling is
+-- skipped here so the frame-time metric stays accurate.
+local heartbeatConnection = nil
+if RunService.Heartbeat and RunService.Heartbeat ~= renderSignal then
+	heartbeatConnection = RunService.Heartbeat:Connect(function() update(false) end)
+end
 
 _G.BB_MATCHA_STOP = function()
 	running = false
 	if renderConnection then renderConnection:Disconnect() end
+	if heartbeatConnection then heartbeatConnection:Disconnect() end
 	for _, conn in ipairs(remoteConns) do pcall(function() conn:Disconnect() end) end
 	if baseGravity then pcall(function() Workspace.Gravity = baseGravity end) end
 	Library:Stop()
