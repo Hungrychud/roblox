@@ -143,6 +143,7 @@ local lastParryCountSeen = nil       -- previous character ServerParryCount
 local parryMissEma = 0               -- 0 = landing everything, higher = missing
 local lastBiasAdjust = 0
 local lastLandDistance = nil         -- ball distance when a parry last confirmed
+local debugLog = {}                  -- [DIAGNOSTIC] recent close-ball frames + block reason
 
 -- BEGIN PARRY MATH (pure functions, also exercised by the regression checks)
 local function finite(n)
@@ -150,7 +151,8 @@ local function finite(n)
 end
 
 local function timingProfile(config, stats)
-	local frame = math.clamp(stats.frame + stats.frameJitter * 2, 1 / 240, 0.080)
+	local frame = math.clamp(math.max(stats.frame + stats.frameJitter * 2,
+		stats.lastFrame or 0), 1 / 240, 0.080)
 	local network = config.pingComp and stats.hasPing and stats.ping or 0
 	local jitter = config.pingComp and stats.hasPing and stats.pingJitter or 0
 	if config.autoTune then
@@ -160,6 +162,7 @@ local function timingProfile(config, stats)
 			lead = math.min(config.maxLead, 0.120 + network * config.pingFactor
 				+ math.min(jitter, 0.025) + math.min(frame * 0.5, 0.030)),
 			frame = frame,
+			lookAhead = frame, -- cover travel before the next client observation
 			interval = config.minInterval,
 			retry = math.clamp(math.max(config.clashRetry, frame), config.clashRetry, 0.065),
 			range = 0, -- determined from each ball's speed below
@@ -226,7 +229,53 @@ local function interceptionDistance(config, profile, closing, acceleration)
 		accelerationMargin = math.min(3, math.max(0, closing) * 0.025,
 			0.5 * math.max(0, acceleration) * profile.lead * profile.lead)
 	end
-	return config.contactRadius + extra + math.max(0, closing) * profile.lead + accelerationMargin
+	return config.contactRadius + extra + math.max(0, closing)
+		* (profile.lead + (profile.lookAhead or 0)) + accelerationMargin
+end
+
+local function sampleMotion(state, position, velocity, now, blend)
+	-- Duplicate render/physics observations must not reset the sample clock.
+	local dt = state.motionAt and now - state.motionAt or 0
+	if not state.motionPos or dt > 0.15 or dt < 0 then
+		state.motionPos, state.motionAt = position, now
+		state.measuredVelocity, state.motionConfidence = nil, 0
+	elseif dt >= 0.004 then
+		local delta = position - state.motionPos
+		if delta.Magnitude > 0.001 then
+			local measured = delta / dt
+			local old = state.measuredVelocity
+			local consistent = old and old.Magnitude > 0.001
+				and measured.Unit:Dot(old.Unit) > 0.95
+				and measured.Magnitude >= old.Magnitude * 0.5
+				and measured.Magnitude <= old.Magnitude * 2
+			state.motionConfidence = consistent and (state.motionConfidence or 0) + 1 or 1
+			state.measuredVelocity = measured
+			state.motionPos, state.motionAt = position, now
+		end
+	end
+	local measured = state.measuredVelocity
+	local speed = velocity.Magnitude
+	if blend and measured and now - state.motionAt <= 0.05 then
+		local measuredSpeed = measured.Magnitude
+		local aligned = speed < 0.001 or measured.Unit:Dot(velocity.Unit) > 0.95
+		-- Two coherent displacements can recover severely stale engine speed.
+		-- A single jump cannot override zero velocity or remove the speed bound.
+		if aligned and measuredSpeed > speed and (state.motionConfidence or 0) >= 2 then
+			return measured
+		elseif aligned and speed > 0.001 and measuredSpeed > speed then
+			return velocity.Unit * math.min(measuredSpeed, speed * 1.5)
+		end
+	end
+	return velocity
+end
+
+local function betterThreat(candidate, best)
+	if not best then return true end
+	local ready = candidate.distance <= candidate.triggerDistance
+	local bestReady = best.distance <= best.triggerDistance
+	if ready ~= bestReady then return ready end
+	return candidate.priority > best.priority
+		or (candidate.priority == best.priority and candidate.tti < best.tti)
 end
 
 local function eligibleBall(config, real, aimed, unknownTarget)
@@ -241,6 +290,7 @@ local function samplePerformance(now)
 	if lastFrameAt then
 		local dt = now - lastFrameAt
 		if finite(dt) and dt > 0 and dt < 0.25 then
+			metrics.lastFrame = dt
 			local alpha = 1 - math.exp(-dt / 0.75)
 			local deviation = math.abs(dt - metrics.frame)
 			metrics.frame = metrics.frame + alpha * (dt - metrics.frame)
@@ -593,7 +643,7 @@ local function updateGui()
 	local fpsText = metrics.frames >= 10 and tostring(math.floor(1 / metrics.frame + 0.5)) or "measuring"
 	Status:SetContent(string.format("%s | %s\nPing: %s | FPS estimate: %s | Attempts: %d", mode, threat, pingText, fpsText, parryCount))
 	local rangeText = currentThreat and string.format("%.0f studs", currentThreat.range)
-		or (CONFIG.autoTune and "140-500 studs, based on speed" or tostring(CONFIG.maxRange) .. " studs")
+		or (CONFIG.autoTune and "Based on speed and trigger distance" or tostring(CONFIG.maxRange) .. " studs")
 	local learnText = CONFIG.adaptiveLearning
 		and string.format("+%.0f ms (miss %.0f%%)", learnedBias * 1000, math.clamp(parryMissEma, 0, 1) * 100)
 		or "off"
@@ -731,7 +781,7 @@ local function readBall(object)
 	end
 
 	local speed = velocity.Magnitude
-	if speed < CONFIG.minSpeed then return nil end
+	if not finite(position.Magnitude) or not finite(speed) then return nil end
 
 	local realBall = safeAttribute(object, "realBall")
 	if realBall == nil and object ~= part then
@@ -902,9 +952,16 @@ local function resolveLearning(now)
 	end
 end
 
+-- Helpers are assigned before the update connections are installed.
+local applyPlayerMods, runFeatures, drawFeatureFx, spawnBurst, ballIgnored, curveBall
+
 local function chooseThreat(root, now)
 	local folder = Workspace:FindFirstChild(CONFIG.ballsFolder)
 	if not folder then return nil end
+	local rootPosition = root.Position
+	local rootVelocity = Vector3.new(0, 0, 0)
+	local velocityOk, value = pcall(function() return root.AssemblyLinearVelocity end)
+	if velocityOk and value and finite(value.Magnitude) then rootVelocity = value end
 	local best = nil
 	for _, object in ipairs(folder:GetChildren()) do
 		local ball = readBall(object)
@@ -915,61 +972,49 @@ local function chooseThreat(root, now)
 			state.seen = now
 			if state.target ~= ball.target then
 				state.acceleration, state.closing, state.sampleAt, state.velocity = 0, nil, nil, nil
+				state.motionPos, state.motionAt, state.measuredVelocity = nil, nil, nil
+				state.motionConfidence = 0
 				state.target = ball.target
 			end
-			local offset = root.Position - ball.position
+			ball.velocity = sampleMotion(state, ball.position, ball.velocity, now, CONFIG.velocityBlend)
+			ball.speed = ball.velocity.Magnitude
+			local relativeVelocity = ball.velocity - rootVelocity
+			local offset = rootPosition - ball.position
 			local distance = offset.Magnitude
 			local toRoot = distance > 0.001 and offset / distance or Vector3.new(0, 0, 0)
-			local closing = distance > 0.001 and ball.velocity:Dot(toRoot) or 0
-			if advanceApproach(state, closing, distance) then firedAt[key] = nil end
-			local dt = state.sampleAt and now - state.sampleAt or 0
-			-- Velocity blend: derive closing speed from actual displacement and use
-			-- the larger of engine vs. measured, so an under-reported / stale
-			-- AssemblyLinearVelocity never makes us trigger late. Bounded to reject noise.
-			local effClosing = closing
-			if CONFIG.velocityBlend and state.lastPos and closing > 0 and dt >= 0.004 and dt <= 0.1 then
-				local dirClosing = (ball.position - state.lastPos):Dot(toRoot) / dt
-				if dirClosing > closing then effClosing = math.min(dirClosing, closing * 1.5) end
+			local closing = relativeVelocity:Dot(toRoot)
+			if advanceApproach(state, closing, distance) then
+				firedAt[key], state.rearmedAt = nil, now
 			end
-			local stable = state.velocity and state.velocity.Magnitude > 0
-				and ball.velocity.Unit:Dot(state.velocity.Unit) > 0.95
-			if stable and state.closing and closing > 0 and dt >= 0.004 and dt <= 0.1 then
-				local gain = math.clamp((closing - state.closing) / dt, 0, closing * 2)
-				state.acceleration = (state.acceleration or 0) * 0.75 + gain * 0.25
-			else state.acceleration = 0 end
-			state.closing, state.sampleAt, state.velocity, state.lastPos = closing, now, ball.velocity, ball.position
-			-- Target Player focuses assist parrying on someone else's incoming balls.
+			local dt = state.sampleAt and now - state.sampleAt or 0
+			if not state.sampleAt or dt >= 0.004 then
+				local stable = state.velocity and state.velocity.Magnitude > 0.001
+					and relativeVelocity.Magnitude > 0.001
+					and relativeVelocity.Unit:Dot(state.velocity.Unit) > 0.95
+				if stable and state.closing and closing > 0 and dt <= 0.1 then
+					local gain = math.clamp((closing - state.closing) / dt, 0, closing * 2)
+					state.acceleration = (state.acceleration or 0) * 0.75 + gain * 0.25
+				else state.acceleration = 0 end
+				state.closing, state.sampleAt, state.velocity = closing, now, relativeVelocity
+			end
 			local focusName = (CONFIG.targetPlayer ~= "None" and CONFIG.targetPlayer) or player.Name
 			local aimed = ball.target == focusName
 			local unknown = ball.target == nil or ball.target == ""
-			-- Priority mirrors the game's own threat model. The ball actually meant
-			-- for YOU (aimed, or a fakeout inside its FakeoutRange, or untagged) must
-			-- always beat a ball merely passing by on its way to someone else. This
-			-- is what stops the cooldown-burn that loses fast rallies: we never spend
-			-- the parry on a stray ball while our real one is inbound.
-			local fakeout = (not aimed) and ball.fakeoutRange ~= nil and distance <= ball.fakeoutRange
-			local priority
-			if aimed then priority = 3
-			elseif fakeout then priority = 2
-			elseif unknown then priority = 1
-			elseif CONFIG.anyIncoming then priority = 0   -- stray ball, geometric safety net only
-			else priority = -1 end
-			local eligible = ball.real ~= false and priority >= 0
-			local trigger = interceptionDistance(CONFIG, effective, effClosing, state.acceleration)
+			local fakeout = not aimed and ball.fakeoutRange ~= nil and distance <= ball.fakeoutRange
+			local priority = aimed and 3 or (fakeout and 2 or (unknown and 1 or 0))
+			local eligible = aimed or fakeout or CONFIG.anyIncoming or (unknown and CONFIG.fallback)
+			local trigger = interceptionDistance(CONFIG, effective, closing, state.acceleration)
 			local range = math.max(detectionRange(CONFIG, effective, ball.speed), trigger + 4)
-			if eligible and distance <= range then
-				-- Your ball gets the lenient targeted radius; a stray ball must be on a
-				-- genuine collision course with your hitbox before it counts.
-				local allowedMiss = (priority >= 2) and CONFIG.targetedRadius or CONFIG.contactRadius
-				local tti = impactTime(offset, ball.velocity, CONFIG.contactRadius, allowedMiss)
+			if eligible and ball.speed >= CONFIG.minSpeed and distance <= range
+				and not (ballIgnored and ballIgnored(ball)) then
+				local allowedMiss = priority >= 2 and CONFIG.targetedRadius or CONFIG.contactRadius
+				local tti = impactTime(offset, relativeVelocity, CONFIG.contactRadius, allowedMiss)
 				if tti then
-					local better = not best or priority > best.priority
-						or (priority == best.priority and tti < best.tti)
-					if better then
-						ball.key, ball.state = key, state
-						best = {ball = ball, distance = distance, tti = tti, aimed = aimed,
-							priority = priority, range = range, triggerDistance = trigger}
-					end
+					ball.key, ball.state = key, state
+					local candidate = {ball = ball, distance = distance, tti = tti, aimed = aimed,
+						priority = priority, range = range, triggerDistance = trigger, closing = closing}
+					-- An out-of-window targeted ball must not hide an immediate collision.
+					if betterThreat(candidate, best) then best = candidate end
 				end
 			end
 		end
@@ -977,48 +1022,38 @@ local function chooseThreat(root, now)
 	return best
 end
 
--- Forward declarations so update() (defined first) can call the feature
--- helpers, whose bodies are defined further below.
-local applyPlayerMods, runFeatures, drawFeatureFx, spawnBurst, ballIgnored, curveBall
-
-local function update(doSample)
-	if not running then return end
-	local now = tick()
-	-- Frame timing is measured on the render signal only; the extra Heartbeat
-	-- pass must not halve the measured frame time and shrink the safety margin.
-	if doSample ~= false then samplePerformance(now) end
-	if doSample ~= false then resolveLearning(now) end
-	if applyPlayerMods then pcall(applyPlayerMods) end
-	-- Cleanup also runs while idle, so removed balls don't accumulate.
-	if now - lastCleanup >= 1 then
-		lastCleanup = now
-		for key, state in pairs(tracked) do
-			if now - state.seen > 2 then tracked[key], firedAt[key] = nil, nil end
-		end
+local function attemptThreat(root, threat, now, doSample)
+	-- Share the actual retry/rebound timing with the diagnostic reason.
+	local clash = threat and CONFIG.clashEnabled and (threat.priority or 0) >= 2
+		and threat.distance <= CONFIG.clashRange and threat.ball.speed >= CONFIG.clashMinSpeed
+	local interval = clash and CONFIG.clashInterval or effective.interval
+	local state = threat and threat.ball.state
+	if state and not firedAt[threat.ball.key] and state.rearmedAt
+		and now - state.rearmedAt <= effective.frame * 2 then
+		-- A confirmed rebound is a fresh shot, even with retries disabled.
+		interval = math.min(interval, CONFIG.clashInterval)
 	end
-
-	local root = getRoot()
-	local rootId = root and root.Address
-	if rootId ~= activeRoot then
-		tracked, firedAt = {}, {}
-		pendingFires, lastParryCountSeen = {}, nil
-		activeRoot = rootId
-		lastClick = -math.huge
+	-- [DIAGNOSTIC] record what the engine sees for any close ball, and why it
+	-- does or does not fire, so a death can be replayed from _G.BB_PARRY_LOG.
+	if doSample ~= false and threat and threat.distance < math.max(70, threat.triggerDistance * 1.5) then
+		local reason
+		if not CONFIG.enabled then reason = "disabled"
+		elseif menuOpen then reason = "MENU_OPEN"
+		elseif ballIgnored and ballIgnored(threat.ball) then reason = "ignored"
+		elseif type(isrbxactive) == "function" and not isrbxactive() then reason = "NOT_FOCUSED"
+		elseif threat.distance > threat.triggerDistance then reason = "far>trig"
+		elseif CONFIG.cooldownProtection and now - lastParryEnd < CONFIG.cooldownGap then reason = "cooldownProt"
+		elseif now - lastClick < interval then reason = "interval"
+		elseif not canAttempt(now, firedAt[threat.ball.key], threat.ball.state, clash, effective.retry, CONFIG.maxClashRetries) then reason = "LOCKED"
+		else reason = "->FIRE" end
+		local tgt = threat.ball.target
+		tgt = (tgt == player.Name and "ME") or (tgt == nil and "nil") or (tgt == "" and "empty") or tostring(tgt):sub(1, 8)
+		debugLog[#debugLog + 1] = string.format("t%.2f d=%.1f trg=%.1f spd=%.0f pri=%d tgt=%s %s",
+			now % 100, threat.distance, threat.triggerDistance, threat.ball.speed, threat.priority or -9, tgt, reason)
+		if #debugLog > 240 then table.remove(debugLog, 1) end
 	end
-	if not root then
-		currentThreat = nil
-		updateGui()
-		updatePreview(nil, nil)
-		return
-	end
-
-	local threat = chooseThreat(root, now)
-	currentThreat = threat
-	updateGui()
-	updatePreview(root, threat)
-	if drawFeatureFx then pcall(drawFeatureFx, root, threat) end
-	if runFeatures then pcall(runFeatures, now, root, threat) end
 	if not CONFIG.enabled or not threat or menuOpen then return end
+	if type(isrbxactive) == "function" and not isrbxactive() then return end
 	if ballIgnored and ballIgnored(threat.ball) then return end
 	if threat.distance > threat.triggerDistance then
 		-- Kill pre click: allow one early blind click on a fast, nearby ball.
@@ -1028,18 +1063,9 @@ local function update(doSample)
 		end
 		return
 	end
-	if type(isrbxactive) == "function" and not isrbxactive() then return end
 	-- Cooldown protection: keep a minimum gap after the previous parry.
 	if CONFIG.cooldownProtection and now - lastParryEnd < CONFIG.cooldownGap then return end
 
-	-- Close-range retries only for a genuine fast, point-blank exchange with YOUR
-	-- ball (priority >= 2). Uses the fixed clashRange, not the auto-expanded one,
-	-- so normal mid-range incoming balls do not trigger rapid re-fire.
-	local clash = CONFIG.clashEnabled and (threat.priority or 0) >= 2
-		and threat.distance <= CONFIG.clashRange
-		and threat.ball.speed >= CONFIG.clashMinSpeed
-	local interval = effective.interval
-	if clash then interval = CONFIG.clashInterval end
 	if now - lastClick < interval then return end
 
 	local key, state = threat.ball.key, threat.ball.state
@@ -1066,6 +1092,39 @@ local function update(doSample)
 		lastFireDistance = threat.distance
 		if curveBall then curveBall(threat.ball, root) end
 		if spawnBurst then spawnBurst(threat.ball.position) end
+	end
+end
+
+-- The critical path completes before any Drawing/UI or optional feature work.
+local function update(doSample)
+	if not running then return end
+	local now = tick()
+	if doSample ~= false then samplePerformance(now) end
+	local root = getRoot()
+	local rootId = root and (root.Address or root:GetFullName())
+	if rootId ~= activeRoot then
+		tracked, firedAt = {}, {}
+		pendingFires, lastParryCountSeen = {}, nil
+		activeRoot, lastClick = rootId, -math.huge
+	end
+	local threat = root and chooseThreat(root, now) or nil
+	currentThreat = threat
+	if root then attemptThreat(root, threat, now, doSample) end
+
+	-- Heartbeat only does detection/input. Draw once per render callback.
+	if doSample ~= false then
+		resolveLearning(now)
+		pcall(updateGui)
+		updatePreview(root, threat)
+		if root and drawFeatureFx then pcall(drawFeatureFx, root, threat) end
+		if applyPlayerMods then pcall(applyPlayerMods) end
+		if root and runFeatures then pcall(runFeatures, now, root, threat) end
+		if now - lastCleanup >= 1 then
+			lastCleanup = now
+			for key, state in pairs(tracked) do
+				if now - state.seen > 2 then tracked[key], firedAt[key] = nil, nil end
+			end
+		end
 	end
 end
 
@@ -1393,12 +1452,17 @@ _G.BB_MATCHA_STATUS = function()
 		closeRangeRetries = CONFIG.clashEnabled,
 		fps = 1 / metrics.frame, pingMs = metrics.hasPing and metrics.ping * 1000 or nil,
 		leadMs = effective.lead * 1000, retryMs = effective.retry * 1000,
-		clashRange = effective.clashRange, attempts = parryCount,
+		clashRange = CONFIG.clashRange, attempts = parryCount,
+		lookAheadMs = (effective.lookAhead or 0) * 1000,
+		impactMs = currentThreat and currentThreat.tti * 1000,
 		lastFireDistance = lastFireDistance, triggerDistance = currentThreat and currentThreat.triggerDistance,
 		extraDistance = CONFIG.earlyParry and CONFIG.extraDistance or 0,
 		adaptiveLearning = CONFIG.adaptiveLearning, learnedBiasMs = learnedBias * 1000,
 		missRate = parryMissEma, serverParryCount = lastParryCountSeen}
 end
+
+-- [DIAGNOSTIC] read recent close-ball frames after a death.
+_G.BB_PARRY_LOG = function() return debugLog end
 
 Library:OnUnload(function()
 	if running and _G.BB_MATCHA_STOP then _G.BB_MATCHA_STOP() end

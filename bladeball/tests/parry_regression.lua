@@ -7,7 +7,7 @@ local last = assert(source:find("-- END PARRY MATH", first, true))
 local mathSource = source:sub(first, last - 1)
 local core = assert(loadstring(mathSource .. [[
 return {advance = advanceApproach, eligible = eligibleBall, intercept = interceptionDistance, profile = timingProfile, range = detectionRange, impact = impactTime,
-    attempt = canAttempt, finite = finite}
+    attempt = canAttempt, finite = finite, motion = sampleMotion, better = betterThreat}
 ]]))()
 local count = 0
 local function check(value, label)
@@ -95,4 +95,66 @@ check(not core.attempt(1, 0.5, shot, true, 0.045, 2), "confirmed outgoing ball c
 check(core.advance(shot, 100, 11.4), "fresh inward approach after departure rearms")
 check(not shot.locked and shot.retries == 0, "new approach resets retry budget")
 check(not core.advance(shot, 100, 10), "same new approach cannot rearm twice")
+-- Duplicate callback samples must preserve the displacement observation clock.
+local motion = {}
+core.motion(motion, v(0, 0, 0), v(100, 0, 0), 0, true)
+core.motion(motion, v(0, 0, 0), v(100, 0, 0), 0.009, true)
+check(motion.motionAt == 0, "duplicate sample keeps original timestamp")
+local recovered = core.motion(motion, v(10, 0, 0), v(100, 0, 0), 0.01, true)
+check(close(recovered.Magnitude, 150), "single jump is bounded")
+core.motion(motion, v(10, 0, 0), v(100, 0, 0), 0.019, true)
+recovered = core.motion(motion, v(20, 0, 0), v(100, 0, 0), 0.02, true)
+check(close(recovered.Magnitude, 1000), "coherent motion recovers understated speed")
+check(close(core.motion(motion, v(20, 0, 0), v(-100, 0, 0), 0.021, true).X, -100),
+    "old measured velocity cannot override a rebound")
+check(close(core.motion(motion, v(20, 0, 0), v(100, 0, 0), 0.03, false).X, 100),
+    "velocity blend toggle")
+check(close(core.motion(motion, v(20, 0, 0), v(100, 0, 0), 0.08, true).X, 100),
+    "stale measured velocity expires")
+core.motion(motion, v(200, 0, 0), v(100, 0, 0), 1, true)
+check(motion.motionConfidence == 0, "long observation gap resets confidence")
+
+local stopped = {}
+core.motion(stopped, v(0, 0, 0), v(0, 0, 0), 0, true)
+check(core.motion(stopped, v(10, 0, 0), v(0, 0, 0), 0.01, true).Magnitude == 0,
+    "one position jump with zero engine speed is not trusted")
+check(close(core.motion(stopped, v(20, 0, 0), v(0, 0, 0), 0.02, true).X, 1000),
+    "two coherent movements recover zero engine velocity")
+
+local delayed = stats(144, 0)
+delayed.lastFrame = 0.06
+config.autoTune, config.extraDistance = true, 4
+local stalled = core.profile(config, delayed)
+check(stalled.lookAhead >= 0.06, "recent frame stall increases next-check budget immediately")
+check(core.intercept(config, stalled, 5000, 0) >= 4.5 + 4 + 5000 * (stalled.lead + 0.06),
+    "fast-ball trigger covers full next-check travel")
+check(core.impact(v(100, 0, 0), v(100, 0, 0) - v(50, 0, 0), 4.5, 18) > 0.955,
+    "player moving away increases relative impact time")
+check(core.impact(v(100, 0, 0), v(100, 0, 0) - v(-50, 0, 0), 4.5, 18) < 0.955,
+    "player moving toward ball decreases relative impact time")
+local urgent = {distance = 20, triggerDistance = 25, priority = 0, tti = 0.1}
+local distant = {distance = 100, triggerDistance = 25, priority = 3, tti = 1}
+check(core.better(urgent, distant), "immediate collision beats out-of-window tagged ball")
+distant.distance = 22
+check(not core.better(urgent, distant), "target priority preserved when both are in-window")
+
+-- Sampled straight-flight sweeps: detect on the current observation if the
+-- next one would enter the original lead window, even at very high speeds.
+for _, fps in ipairs({12, 30, 60, 144, 240}) do
+    for _, speed in ipairs({30, 500, 3000, 10000, 25000}) do
+        local timing = core.profile(config, stats(fps, 0.05))
+        local fired = false
+        for frame = 0, fps * 2 do
+            local distance = 4.5 + speed * (1 - frame / fps)
+            local tti = core.impact(v(distance, 0, 0), v(speed, 0, 0), 4.5, 18)
+            if tti and distance <= core.intercept(config, timing, speed, 0) then
+                check(tti > 0, "sampled flight fires before contact")
+                check(tti + 1 / fps >= timing.lead, "sampled flight preserves reaction lead")
+                fired = true
+                break
+            end
+        end
+        check(fired, "sampled high-speed flight detected")
+    end
+end
 print("PASS: " .. count .. " parry regression checks")
