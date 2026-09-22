@@ -44,7 +44,7 @@ local CONFIG = {
 	targetedRadius = 18,
 	-- ---- Reactive parry geometry ----
 	standoff = 12,                  -- hard min buffer: never let the ball get closer than this at press
-	maxParryRange = 80,             -- furthest a parry still registers (auto-calibrated from live hits)
+	maxParryRange = 100,            -- furthest a parry still registers (auto-calibrated from live hits; live hits confirmed to 82)
 	calibrateRange = true,          -- learn maxParryRange from confirmed ServerParryCount outcomes
 	baseLead = 0.12,
 	pingComp = true,
@@ -223,7 +223,10 @@ local function advanceApproach(state, closing, distance)
 	if state.locked then
 		if closing < -2 then
 			state.departureStart = state.departureStart or state.lastDistance or distance
-			if distance - state.departureStart >= 0.5 then state.departed = true end
+			-- Require a real outward flight (6 studs), not the ~1 stud of velocity
+			-- jitter seen in close combat, before treating the ball as departed.
+			-- Prevents false re-arms that re-fire the same ball and burn cooldown.
+			if distance - state.departureStart >= 6 then state.departed = true end
 		elseif closing > 2 then
 			if state.departed then
 				state.locked, state.departed, state.departureStart = false, false, nil
@@ -404,7 +407,7 @@ Tuning:Toggle("Adaptive learning", CONFIG.adaptiveLearning, function(v) CONFIG.a
 Tuning:Toggle("Auto-calibrate parry range", CONFIG.calibrateRange, function(v) CONFIG.calibrateRange = v end,
 	"Learn the real max parry range from confirmed hits.")
 Tuning:Slider("Standoff buffer", CONFIG.standoff, 1, 4, 30, " st", function(v) CONFIG.standoff = v end)
-Tuning:Slider("Max parry range", CONFIG.maxParryRange, 1, 40, 120, " st", function(v) CONFIG.maxParryRange = v end)
+Tuning:Slider("Max parry range", CONFIG.maxParryRange, 1, 40, 140, " st", function(v) CONFIG.maxParryRange = v end)
 Tuning:Slider("Reaction lead (manual)", CONFIG.baseLead * 1000, 1, 20, math.floor(CONFIG.maxLead * 1000 + 0.5), " ms",
 	function(v) CONFIG.baseLead = v / 1000 end)
 
@@ -810,7 +813,7 @@ local function updateRangeCalibration(now)
 				calibDistMax = math.max(calibDistMax, f.dist)
 				-- Sit a few studs beyond the furthest confirmed parry so a genuine
 				-- in-range ball is never rejected, but stay bounded.
-				CONFIG.maxParryRange = math.clamp(math.max(CONFIG.maxParryRange, f.dist + 6), 40, 120)
+				CONFIG.maxParryRange = math.clamp(math.max(CONFIG.maxParryRange, f.dist + 6), 40, 140)
 			end
 		end
 	end
@@ -820,7 +823,7 @@ local function updateRangeCalibration(now)
 			local f = table.remove(rangeFires, i)
 			-- Fired near the current cap yet nothing confirmed: the cap is too far.
 			if f.dist > math.max(calibDistMax, CONFIG.maxParryRange - 8) then
-				CONFIG.maxParryRange = math.clamp(CONFIG.maxParryRange - 2, 40, 120)
+				CONFIG.maxParryRange = math.clamp(CONFIG.maxParryRange - 2, 40, 140)
 			end
 		end
 	end
