@@ -26,14 +26,15 @@ end
 
 local CONFIG = {
 	enabled = true,
-	-- Parry any real ball on a collision course with you. The `target` tag is not
-	-- reliable for the local player in every mode, so gating on target==you alone
-	-- can miss your own ball; geometric detection (impactTime) is the safety net.
-	anyIncoming = true,
+	-- Only parry balls that are actually a threat to YOU: tagged at you (aimed) or
+	-- juking toward you within their FakeoutRange. anyIncoming/fallback are OFF so
+	-- the parry is spent on your own ball -- clean clashes, no cooldown burnt on
+	-- balls passing to someone else.
+	anyIncoming = false,
 	autoTune = true,
 	earlyParry = false,             -- reactive model: no extra-distance creep
 	extraDistance = 4,
-	accelerationPrediction = false, -- reactive model: do not extrapolate acceleration
+	accelerationPrediction = true,  -- fire earlier when the ball is genuinely speeding up (capped +3 studs, never delays)
 	predictionPreview = false,      -- overlay removed from GUI; keep off
 	compactHud = true,
 	ballsFolder = "Balls",
@@ -56,7 +57,9 @@ local CONFIG = {
 	clashMinSpeed = 110,      -- real fast exchange (was 70)
 	clashRetry = 0.045,
 	maxClashRetries = 2,
-	fallback = true,
+	clashProximity = 32,      -- when an alive opponent is within this many studs, force fast
+	                          -- clash timing on the threat so rapid volleys never slip past
+	fallback = false,
 
 	-- ---- Combat additions ----
 	targetPlayer = "None",          -- only parry balls aimed at this player (assist)
@@ -95,7 +98,7 @@ local CONFIG = {
 	immortality = false,
 
 	-- ---- Accuracy engine (outside-the-box) ----
-	adaptiveLearning = false,  -- opt-in: self-tune lead from ServerParryCount outcomes
+	adaptiveLearning = true,   -- self-tune lead earlier from live ServerParryCount misses (bounded)
 	velocityBlend = true,      -- never under-estimate ball speed (positional derivative)
 	maxLearnBias = 0.06,       -- ceiling on how much earlier learning may fire (s)
 	instantPredict = false,    -- (prediction) fire at exact sub-frame instant — off: reactive model
@@ -347,159 +350,84 @@ local function samplePerformance(now)
 	end
 end
 
--- Load the user-selected Matcha UI library.
-local fetched, source = pcall(function()
-	return game:HttpGet("https://scripts.wabisabi.mom/wabi-sabi-ui-lib.lua")
+-- Load the INS-ui Drawing UI library (github.com/neaxusxgod-png/INS-ui).
+-- It renders with the Drawing API (Square/Text/Image). Matcha only confirms
+-- Text/Circle/Line/Triangle, so the menu may not draw under Matcha; parrying
+-- still runs headless (it fires mouse1click, independent of the menu). The
+-- compact Drawing HUD below is the reliable fallback readout.
+local fetched, chunkOrErr = pcall(function()
+	return game:HttpGet("https://raw.githubusercontent.com/neaxusxgod-png/INS-ui/main/uilib.min.lua")
 end)
-assert(fetched and type(source) == "string", "Could not download WabiSabi UI")
--- Extend WabiSabi's own renderer so help follows dragging, scrolling and tabs.
--- Plain, checked anchors avoid silently patching an incompatible library release.
-local function extendUi(anchor, replacement)
-	local first, last = source:find(anchor, 1, true)
-	assert(first and not source:find(anchor, last + 1, true), "WabiSabi help integration needs updating")
-	source = source:sub(1, first - 1) .. replacement .. source:sub(last + 1)
-end
-local titleAnchor = '    text(idp .. ".t", el.title, titleX, titleY, 13, Theme.Text, z + 2)'
-extendUi(titleAnchor, [=[
-    local help = UI.HelpText and UI.HelpText[el.title]
-    if help then
-        local hx, hy = titleX + 6, titleY + 7
-        local helpHover = inBounds(hx - 9, hy - 9, 18, 18)
-            and not State.Overlay and not State.Dialog and not State.Drag
-        circle(idp .. ".help.bg", hx, hy, 7, helpHover and Theme.Accent or Theme.Control, 1, z + 3)
-        text(idp .. ".help.q", "?", hx, titleY, 12, Theme.Text, z + 4, true)
-        titleX = titleX + 22
-        if helpHover then
-            UI._hoverHelp = help
-            hovered = false
-        end
-    end
-]=] .. titleAnchor)
-extendUi('    if State.Minimized then renderBubble(dt) else renderWindow(dt) end',
-	'    UI._hoverHelp = nil\n    if State.Minimized then renderBubble(dt) else renderWindow(dt) end')
-extendUi('    renderNotifs(dt)\n    cleanup()', [=[
-    renderNotifs(dt)
-    if UI._hoverHelp and not State.Minimized then
-        local vw, vh = getViewport()
-        local width = math.min(280, vw - 16)
-        local lines = wrapText(UI._hoverHelp, 12, width - 24)
-        local height = #lines * 16 + 20
-        local tx = clamp(Input.mx + 16, 8, math.max(8, vw - width - 8))
-        local ty = Input.my + 22
-        if ty + height > vh - 8 then ty = Input.my - height - 12 end
-        ty = math.max(8, ty)
-        rect("help.tooltip.bg", tx, ty, width, height, Theme.OverlayBg, 1, 300, 6)
-        outline("help.tooltip.border", tx, ty, width, height, Theme.Accent, 0.8, 301, 6)
-        for i, ln in ipairs(lines) do
-            text("help.tooltip.line" .. i, ln, tx + 12, ty + 10 + (i - 1) * 16, 12, Theme.Text, 302)
-        end
-    end
-    cleanup()
-]=])
-local uiChunk, compileError = loadstring(source)
-assert(uiChunk, "Could not compile WabiSabi: " .. tostring(compileError))
-local loadedLibrary = uiChunk()
-local Library = WabiSabi or loadedLibrary
-assert(type(Library) == "table" and type(Library.CreateWindow) == "function", "Invalid WabiSabi UI")
-Library.HelpText = {
-	["Any incoming ball"] = "Considers moving balls in Workspace.Balls regardless of who sent them or their target tag: players, bots, and launchers. Non-targeted balls must be on a close incoming path. Known visual duplicates are excluded.",
-	["Earlier parry"] = "Adds the extra-distance buffer to the existing speed and ping prediction. This presses parry sooner; it cannot increase the server's actual parry range.",
-	["Extra distance (studs)"] = "Additional distance before the normal trigger. Default: 4 studs. Lower this if inputs happen too early. Works in both automatic and manual modes.",
-	["Acceleration prediction"] = "Uses recent stable incoming velocity changes to allow a small earlier trigger when the ball accelerates. The extra allowance is capped at 3 studs and never delays a parry.",
-	["Prediction preview"] = "Marks the incoming ball and shows its estimated position after the timing lead. Green means it has entered the planned trigger distance. This is an estimate, not a guaranteed path.",
-	["Compact match HUD"] = "Shows current ball distance, planned trigger distance, and the distance of your last attempt while the menu is minimized. Attempts are not confirmed hits.",
-	["Automatic tuning"] = "Uses smoothed ping, network jitter, frame time and ball speed to choose timing, detection range and close-range retry delay. Turn it off to use the manual sliders. These are bounded estimates, not guaranteed optimal settings.",
-	["Auto parry"] = "Automatically clicks when an incoming real ball reaches your parry timing window. T toggles it. Minimize with P to play.",
-	["Close-range retries"] = "Allows up to two extra attempts during fast, nearby exchanges if a rebound was missed between updates.",
-	["Fallback targeting"] = "When Any incoming ball is OFF, also consider incoming real balls with an unknown target. Any incoming ball overrides this target restriction.",
-	["Ping compensation"] = "Accounts for measured network delay and its variation. Automatic tuning preserves the working base timing. Turn off to omit the network margin.",
-	["Reaction lead (ms)"] = "Manual setting, used only when automatic tuning is off. Higher values click earlier; too high can waste the parry window.",
-	["Detection range (studs)"] = "Manual setting, used only when automatic tuning is off. Automatic mode expands detection with ball speed; it does not change the game's actual parry range.",
-	["Close-range distance (studs)"] = "Manual setting, used only when automatic tuning is off. Controls where fast incoming balls may use bounded retries. Requires close-range retries enabled.",
-	["Theme"] = "Changes the window colors. It does not change auto-parry behavior.",
-	["Minimize and play"] = "Collapses the menu into a small bubble and lets auto-parry run when enabled. Press P or click the bubble to restore it.",
-	["Unload script"] = "Stops auto-parry and removes this UI. Run the loader again to restart.",
-}
+assert(fetched and type(chunkOrErr) == "string", "Could not download INS-ui")
+local uiChunk, compileError = loadstring(chunkOrErr)
+assert(uiChunk, "Could not compile INS-ui: " .. tostring(compileError))
+local Lib = uiChunk() or (type(INSUI) ~= "nil" and INSUI) or _G["INSUI"]
+assert(type(Lib) == "table" and type(Lib.CreateWindow) == "function", "Invalid INS-ui library")
 
-local Window = Library:CreateWindow({
-	Title = "Matcha",
-	SubTitle = "Auto Parry",
-	Size = Vector2.new(600, 520),
-	Theme = "Ocean",
-	MinimizeKey = "P",
-})
 for _, plr in ipairs(Players:GetPlayers()) do
 	if plr ~= player then playerNames[#playerNames + 1] = plr.Name end
 end
 
+-- Dynamic status strings. updateGui refreshes them; the Labels below read them
+-- so INS-ui re-renders the live values each frame.
+local statusText = "Waiting for ball"
+local tuningText = "Measuring ping and frame time..."
+
+local Window = Lib:CreateWindow({
+	title = "Matcha",
+	subtitle = "Auto Parry",
+	size = Vector2.new(620, 520),
+	menuKey = "p",
+})
+
 -- ======================= AUTO PARRY =======================
-local Main = Window:AddTab({Title = "Auto Parry"})
-Main:AddParagraph({
-	Title = "Controls",
-	Content = "Drag the title bar to move. P minimizes/plays; T toggles auto parry.\nAuto parry pauses while this window is open.",
-})
-local Controls = Main:AddSection("Auto Parry")
-Controls:AddToggle({
-	Id = "AutoParry", Title = "Auto parry", Default = CONFIG.enabled,
-	Keybind = {Default = "T", Mode = "Toggle"},
-	Callback = function(value) CONFIG.enabled = value end,
-})
-Controls:AddToggle({
-	Id = "AnyIncoming", Title = "Any incoming ball", Default = CONFIG.anyIncoming,
-	Callback = function(value) CONFIG.anyIncoming = value end,
-})
-Controls:AddToggle({
-	Id = "Clash", Title = "Close-range retries", Default = CONFIG.clashEnabled,
-	Callback = function(value) CONFIG.clashEnabled = value end,
-})
-Controls:AddToggle({
-	Id = "Fallback", Title = "Fallback targeting", Default = CONFIG.fallback,
-	Callback = function(value) CONFIG.fallback = value end,
-})
-Controls:AddToggle({
-	Id = "Ping", Title = "Ping compensation", Default = CONFIG.pingComp,
-	Callback = function(value) CONFIG.pingComp = value end,
-})
-Controls:AddSlider({
-	Title = "Accuracy (%)", Default = CONFIG.accuracy, Min = 0, Max = 100, Rounding = 0,
-	Callback = function(value) CONFIG.accuracy = value end,
-})
+local Main = Window:Tab("Auto Parry", "sword")
+local Controls = Main:Section("Auto Parry", "Left", "T toggles auto parry. Parry runs even while the menu is open.")
+Controls:Toggle("Auto parry", CONFIG.enabled, function(v) CONFIG.enabled = v end,
+	"Clicks when an incoming real ball reaches your parry timing window. Only parries balls that threaten you."):AddKeybind("t", "Toggle")
+Controls:Toggle("Ping compensation", CONFIG.pingComp, function(v) CONFIG.pingComp = v end,
+	"Add measured network delay and jitter to the timing lead.")
+Controls:Slider("Clash proximity", CONFIG.clashProximity, 1, 0, 80, " st", function(v) CONFIG.clashProximity = v end)
+Controls:Slider("Accuracy", CONFIG.accuracy, 1, 0, 100, "%", function(v) CONFIG.accuracy = v end)
 
-local Tuning = Main:AddSection("Tuning")
-Tuning:AddToggle({Id = "AutoTune", Title = "Automatic tuning", Default = CONFIG.autoTune,
-	Callback = function(value) CONFIG.autoTune = value end})
-Tuning:AddToggle({Id = "VelocityBlend", Title = "Velocity blend (anti-late)", Default = CONFIG.velocityBlend,
-	Callback = function(value) CONFIG.velocityBlend = value end})
-Tuning:AddToggle({Id = "InstantAcquire", Title = "Instant acquire (first-frame speed)", Default = CONFIG.instantAcquire,
-	Callback = function(value) CONFIG.instantAcquire = value end})
-Tuning:AddToggle({Id = "CalibrateRange", Title = "Auto-calibrate parry range", Default = CONFIG.calibrateRange,
-	Callback = function(value) CONFIG.calibrateRange = value end})
-Tuning:AddSlider({Id = "Standoff", Title = "Standoff buffer (studs)", Default = CONFIG.standoff,
-	Min = 4, Max = 30, Rounding = 0, Callback = function(value) CONFIG.standoff = value end})
-Tuning:AddSlider({Id = "MaxParryRange", Title = "Max parry range (studs)", Default = CONFIG.maxParryRange,
-	Min = 40, Max = 120, Rounding = 0, Callback = function(value) CONFIG.maxParryRange = value end})
-Tuning:AddSlider({Id = "Lead", Title = "Reaction lead (ms, manual)", Default = CONFIG.baseLead * 1000,
-	Min = 20, Max = CONFIG.maxLead * 1000, Rounding = 0, Callback = function(value) CONFIG.baseLead = value / 1000 end})
+local Tuning = Main:Section("Tuning", "Right", "Timing and accuracy engine.")
+Tuning:Toggle("Automatic tuning", CONFIG.autoTune, function(v) CONFIG.autoTune = v end,
+	"Choose timing and range from ping, jitter, frame time and ball speed.")
+Tuning:Toggle("Velocity blend (anti-late)", CONFIG.velocityBlend, function(v) CONFIG.velocityBlend = v end,
+	"Never under-estimate ball speed; uses the positional derivative.")
+Tuning:Toggle("Instant acquire", CONFIG.instantAcquire, function(v) CONFIG.instantAcquire = v end,
+	"Trust measured speed on the first frame a threat is seen.")
+Tuning:Toggle("Acceleration prediction", CONFIG.accelerationPrediction, function(v) CONFIG.accelerationPrediction = v end,
+	"Fire a touch earlier when the ball is genuinely speeding up (capped +3 studs, never delays).")
+Tuning:Toggle("Adaptive learning", CONFIG.adaptiveLearning, function(v) CONFIG.adaptiveLearning = v end,
+	"Self-tune the lead earlier from live ServerParryCount misses (bounded).")
+Tuning:Toggle("Auto-calibrate parry range", CONFIG.calibrateRange, function(v) CONFIG.calibrateRange = v end,
+	"Learn the real max parry range from confirmed hits.")
+Tuning:Slider("Standoff buffer", CONFIG.standoff, 1, 4, 30, " st", function(v) CONFIG.standoff = v end)
+Tuning:Slider("Max parry range", CONFIG.maxParryRange, 1, 40, 120, " st", function(v) CONFIG.maxParryRange = v end)
+Tuning:Slider("Reaction lead (manual)", CONFIG.baseLead * 1000, 1, 20, math.floor(CONFIG.maxLead * 1000 + 0.5), " ms",
+	function(v) CONFIG.baseLead = v / 1000 end)
 
-Main:AddButton({Title = "Minimize and play", Callback = function() Library:Minimize() end})
-Main:AddButton({Title = "Unload script", Callback = function()
+local StatusSec = Main:Section("Live status", "Left")
+StatusSec:Label(function() return statusText end)
+StatusSec:Label(function() return tuningText end)
+StatusSec:Button("Unload script", function()
 	if _G.BB_MATCHA_STOP then _G.BB_MATCHA_STOP() end
-end})
+end)
 
-local Status = Main:AddParagraph({Title = "Live status", Content = "Waiting for ball"})
-local TuningStatus = Main:AddParagraph({Title = "Effective settings", Content = "Measuring ping and frame time..."})
-
-Library:OnMinimized(function(minimized) menuOpen = not minimized end)
+-- No menu-open pause: parry stays active while the menu is visible. Firing
+-- mouse1click is independent of the Drawing menu, so this only adds coverage.
+menuOpen = false
 
 local function updateGui()
 	local now = os.clock()
 	if now - lastUiUpdate < 0.15 then return end
 	lastUiUpdate = now
-	local mode = not CONFIG.enabled and "Disabled" or (menuOpen and "Paused while menu is open" or "Active")
+	local mode = not CONFIG.enabled and "Disabled" or "Active"
 	local threat = currentThreat and string.format("Ball: %.1f studs | Trigger: %.1f studs", currentThreat.distance, currentThreat.triggerDistance) or "Waiting for ball"
 	local pingText = metrics.hasPing and string.format("%d ms", math.floor(lastPing * 1000 + 0.5)) or "unavailable"
 	local fpsText = metrics.frames >= 10 and tostring(math.floor(1 / metrics.frame + 0.5)) or "measuring"
-	Status:SetContent(string.format("%s | %s\nPing: %s | FPS estimate: %s | Attempts: %d", mode, threat, pingText, fpsText, parryCount))
+	statusText = string.format("%s | %s\nPing: %s | FPS estimate: %s | Attempts: %d", mode, threat, pingText, fpsText, parryCount)
 	local rangeText = currentThreat and string.format("%.0f studs", currentThreat.range)
 		or (CONFIG.autoTune and "Based on speed and trigger distance" or tostring(CONFIG.maxRange) .. " studs")
 	local learnText = CONFIG.adaptiveLearning
@@ -507,10 +435,10 @@ local function updateGui()
 		or "off"
 	local calibText = CONFIG.calibrateRange
 		and string.format(" (learned, max hit %.0fst)", calibDistMax) or ""
-	TuningStatus:SetContent(string.format("%s | Lead: %.0f ms | Retry: %.0f ms\nScan: %s | Standoff: %.0f st | Parry range: %.0f st%s\nPing jitter: %.0f ms | Frame budget: %.1f ms\nLearned bias: %s",
+	tuningText = string.format("%s | Lead: %.0f ms | Retry: %.0f ms\nScan: %s | Standoff: %.0f st | Parry range: %.0f st%s\nPing jitter: %.0f ms | Frame budget: %.1f ms\nLearned bias: %s",
 		CONFIG.autoTune and "Automatic" or "Manual", effective.lead * 1000, effective.retry * 1000,
 		rangeText, CONFIG.standoff, CONFIG.maxParryRange, calibText,
-		metrics.pingJitter * 1000, effective.frame * 1000, learnText))
+		metrics.pingJitter * 1000, effective.frame * 1000, learnText)
 end
 
 -- Fixed Drawing pool. Failure in the optional preview must not stop parrying.
@@ -791,6 +719,33 @@ local function cachedNearest(root)
 	return nearestBall, nearestDist
 end
 
+-- Distance to the closest ALIVE opponent, cached per frame. Used to force fast
+-- clash timing when you close in on someone so the rapid volley never slips past.
+local oppFrame, oppDist = -1, nil
+local function cachedOpponentDist(root)
+	if frameId ~= oppFrame then
+		oppFrame, oppDist = frameId, nil
+		local alive = Workspace:FindFirstChild("Alive")
+		if alive and root then
+			local best = math.huge
+			for _, model in ipairs(alive:GetChildren()) do
+				if model.Name ~= player.Name then
+					local ok, hrp = pcall(function() return model:FindFirstChild("HumanoidRootPart") end)
+					if ok and hrp then
+						local posOk, pos = pcall(function() return hrp.Position end)
+						if posOk and pos then
+							local d = (root.Position - pos).Magnitude
+							if d < best then best = d end
+						end
+					end
+				end
+			end
+			if best < math.huge then oppDist = best end
+		end
+	end
+	return oppDist
+end
+
 -- =====================================================================
 -- Closed-loop lead calibration.
 -- The character's ServerParryCount rises once per server-confirmed parry.
@@ -943,8 +898,15 @@ end
 
 local function attemptThreat(root, threat, now, doSample)
 	-- Share the actual retry/rebound timing with the diagnostic reason.
-	local clash = threat and CONFIG.clashEnabled and (threat.priority or 0) >= 2
-		and threat.distance <= CONFIG.clashRange and threat.ball.speed >= CONFIG.clashMinSpeed
+	-- Proximity clash: when an alive opponent is within clashProximity, you are in
+	-- a close exchange -- force the fast clash timing on your threat regardless of
+	-- ball speed so a rapid volley cannot slip past between frames.
+	local nearOpp = cachedOpponentDist(root)
+	local proximityClash = (CONFIG.clashProximity or 0) > 0 and nearOpp ~= nil
+		and nearOpp <= CONFIG.clashProximity
+	local clash = threat and CONFIG.clashEnabled and (proximityClash
+		or ((threat.priority or 0) >= 2 and threat.distance <= CONFIG.clashRange
+			and threat.ball.speed >= CONFIG.clashMinSpeed))
 	local interval = clash and CONFIG.clashInterval or effective.interval
 	local state = threat and threat.ball.state
 	if state and not firedAt[threat.ball.key] and state.rearmedAt
@@ -1101,14 +1063,24 @@ local heartbeatConnection = nil
 if RunService.Heartbeat and RunService.Heartbeat ~= renderSignal then
 	heartbeatConnection = RunService.Heartbeat:Connect(function() update(false) end)
 end
+-- Third, pre-physics pass: PreSimulation fires before the engine integrates the
+-- step, so together with the render + post-physics passes the gap between ball
+-- observations shrinks -- a fast ball is far less likely to slip across the
+-- trigger band unseen between frames (a common "too late" cause on frame hitches).
+local preSimConnection = nil
+if RunService.PreSimulation and RunService.PreSimulation ~= renderSignal
+	and RunService.PreSimulation ~= RunService.Heartbeat then
+	preSimConnection = RunService.PreSimulation:Connect(function() update(false) end)
+end
 
 _G.BB_MATCHA_STOP = function()
 	running = false
 	if renderConnection then renderConnection:Disconnect() end
 	if heartbeatConnection then heartbeatConnection:Disconnect() end
+	if preSimConnection then preSimConnection:Disconnect() end
 	for _, conn in ipairs(remoteConns) do pcall(function() conn:Disconnect() end) end
 	if baseGravity then pcall(function() Workspace.Gravity = baseGravity end) end
-	Library:Stop()
+	pcall(function() Lib:Destroy() end)
 	for _, object in ipairs(overlayObjects) do pcall(function() object:Remove() end) end
 	firedAt = {}
 	_G.BB_MATCHA_STOP = nil
@@ -1133,9 +1105,13 @@ end
 -- [DIAGNOSTIC] read recent close-ball frames after a death.
 _G.BB_PARRY_LOG = function() return debugLog end
 
-Library:OnUnload(function()
-	if running and _G.BB_MATCHA_STOP then _G.BB_MATCHA_STOP() end
-end)
+-- INS-ui exposes no OnUnload hook; guard in case a future build adds one.
+if type(Lib.OnUnload) == "function" then
+	pcall(function()
+		Lib:OnUnload(function()
+			if running and _G.BB_MATCHA_STOP then _G.BB_MATCHA_STOP() end
+		end)
+	end)
+end
 
-if restoreMinimized then Library:Minimize() end
-print("WabiSabi auto-parry restored (P minimize/play, T toggle)")
+print("INS-ui auto-parry loaded (P menu, T toggle parry)")
