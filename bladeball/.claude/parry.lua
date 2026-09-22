@@ -94,6 +94,8 @@ local CONFIG = {
 	adaptiveLearning = false,  -- opt-in: self-tune lead from ServerParryCount outcomes
 	velocityBlend = true,      -- never under-estimate ball speed (positional derivative)
 	maxLearnBias = 0.06,       -- ceiling on how much earlier learning may fire (s)
+	instantPredict = true,     -- fire at the exact sub-frame impact instant, not the frame edge
+	instantAcquire = true,     -- trust measured ball speed on the first frame a threat is seen
 }
 if type(restoreClash) == "boolean" then CONFIG.clashEnabled = restoreClash end
 
@@ -233,7 +235,7 @@ local function interceptionDistance(config, profile, closing, acceleration)
 		* (profile.lead + (profile.lookAhead or 0)) + accelerationMargin
 end
 
-local function sampleMotion(state, position, velocity, now, blend)
+local function sampleMotion(state, position, velocity, now, blend, instant)
 	-- Duplicate render/physics observations must not reset the sample clock.
 	local dt = state.motionAt and now - state.motionAt or 0
 	if not state.motionPos or dt > 0.15 or dt < 0 then
@@ -263,7 +265,16 @@ local function sampleMotion(state, position, velocity, now, blend)
 		if aligned and measuredSpeed > speed and (state.motionConfidence or 0) >= 2 then
 			return measured
 		elseif aligned and speed > 0.001 and measuredSpeed > speed then
-			return velocity.Unit * math.min(measuredSpeed, speed * 1.5)
+			-- Instant acquire: a single coherent displacement can override a stale
+			-- engine speed sooner (cap 2.5x vs the cautious 1.5x) so a fresh fast
+			-- ball is timed from its true speed one frame earlier.
+			local cap = instant and 2.5 or 1.5
+			return velocity.Unit * math.min(measuredSpeed, speed * cap)
+		elseif instant and aligned and speed <= 0.001 and measuredSpeed > 0.001
+			and (state.motionConfidence or 0) >= 1 then
+			-- Engine reported no velocity at all but the ball plainly moved; use the
+			-- measured vector directly so a dead-read never delays detection.
+			return measured
 		end
 	end
 	return velocity
@@ -592,6 +603,14 @@ Timing:AddToggle({Id = "VelocityBlend", Title = "Velocity blend (anti-late)",
 	Default = CONFIG.velocityBlend,
 	Description = "Uses measured ball displacement so an under-reported velocity never triggers late.",
 	Callback = function(value) CONFIG.velocityBlend = value end})
+Timing:AddToggle({Id = "InstantPredict", Title = "Instant predict (exact timing)",
+	Default = CONFIG.instantPredict,
+	Description = "Fires at the exact predicted impact instant (sub-frame) instead of at the frame edge. Removes up to a frame of timing jitter.",
+	Callback = function(value) CONFIG.instantPredict = value end})
+Timing:AddToggle({Id = "InstantAcquire", Title = "Instant acquire (first-frame speed)",
+	Default = CONFIG.instantAcquire,
+	Description = "Trusts the ball's measured speed on the first frame it is seen, so a stale engine velocity never delays detection.",
+	Callback = function(value) CONFIG.instantAcquire = value end})
 local TuningStatus = Timing:AddParagraph({Title = "Effective settings", Content = "Measuring ping and frame time..."})
 Timing:AddSection("Predictive distance (all modes)")
 Timing:AddToggle({Id = "EarlyParry", Title = "Earlier parry", Default = CONFIG.earlyParry,
@@ -976,7 +995,7 @@ local function chooseThreat(root, now)
 				state.motionConfidence = 0
 				state.target = ball.target
 			end
-			ball.velocity = sampleMotion(state, ball.position, ball.velocity, now, CONFIG.velocityBlend)
+			ball.velocity = sampleMotion(state, ball.position, ball.velocity, now, CONFIG.velocityBlend, CONFIG.instantAcquire)
 			ball.speed = ball.velocity.Magnitude
 			local relativeVelocity = ball.velocity - rootVelocity
 			local offset = rootPosition - ball.position
@@ -1071,6 +1090,39 @@ local function attemptThreat(root, threat, now, doSample)
 	local key, state = threat.ball.key, threat.ball.state
 	local previous = firedAt[key]
 	if not canAttempt(now, previous, state, clash, effective.retry, CONFIG.maxClashRetries) then return end
+
+	-- Precise sub-frame timing. The distance gate above means the ball crosses the
+	-- parry line within this frame; instead of clicking now (up to a frame early),
+	-- schedule the click at the exact predicted impact instant. Only for a fresh
+	-- shot (retries/point-blank commit immediately below).
+	local fireIn = threat.tti - effective.lead
+	if CONFIG.instantPredict and not previous and finite(fireIn)
+		and fireIn > 0.003 and fireIn <= effective.frame * 1.5
+		and type(task) == "table" and type(task.delay) == "function" then
+		-- Reserve the shot so following frames neither re-arm nor spam it.
+		lastClick, firedAt[key] = now, now
+		state.locked, state.departed, state.departureStart = true, false, nil
+		state.lastDistance = threat.distance
+		local token = (state.fireToken or 0) + 1
+		state.fireToken = token
+		task.delay(fireIn, function()
+			-- Fire only if this exact prediction is still the live one.
+			if not running or state.fireToken ~= token then return end
+			if not CONFIG.enabled or menuOpen then return end
+			if type(isrbxactive) == "function" and not isrbxactive() then return end
+			if not passesAccuracy() then return end
+			if fireParry() then
+				if CONFIG.adaptiveLearning then pendingFires[#pendingFires + 1] = {t = tick()} end
+				lastParryEnd = tick()
+				parryCount = parryCount + 1
+				lastFireDistance = threat.distance
+				if curveBall then curveBall(threat.ball, root) end
+				if spawnBurst then spawnBurst(threat.ball.position) end
+			end
+		end)
+		return
+	end
+
 	-- Accuracy: consume the shot on a miss roll so the percentage is meaningful.
 	if not passesAccuracy() then
 		lastClick, firedAt[key] = now, now
