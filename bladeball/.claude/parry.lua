@@ -31,9 +31,9 @@ local CONFIG = {
 	-- can miss your own ball; geometric detection (impactTime) is the safety net.
 	anyIncoming = true,
 	autoTune = true,
-	earlyParry = true,
+	earlyParry = false,             -- reactive model: no extra-distance creep
 	extraDistance = 4,
-	accelerationPrediction = true,
+	accelerationPrediction = false, -- reactive model: do not extrapolate acceleration
 	predictionPreview = true,
 	compactHud = true,
 	ballsFolder = "Balls",
@@ -41,6 +41,10 @@ local CONFIG = {
 	maxRange = 140,
 	contactRadius = 4.5,
 	targetedRadius = 18,
+	-- ---- Reactive parry geometry ----
+	standoff = 12,                  -- hard min buffer: never let the ball get closer than this at press
+	maxParryRange = 80,             -- furthest a parry still registers (auto-calibrated from live hits)
+	calibrateRange = true,          -- learn maxParryRange from confirmed ServerParryCount outcomes
 	baseLead = 0.12,
 	pingComp = true,
 	pingFactor = 0.75,
@@ -94,7 +98,7 @@ local CONFIG = {
 	adaptiveLearning = false,  -- opt-in: self-tune lead from ServerParryCount outcomes
 	velocityBlend = true,      -- never under-estimate ball speed (positional derivative)
 	maxLearnBias = 0.06,       -- ceiling on how much earlier learning may fire (s)
-	instantPredict = true,     -- fire at the exact sub-frame impact instant, not the frame edge
+	instantPredict = false,    -- (prediction) fire at exact sub-frame instant — off: reactive model
 	instantAcquire = true,     -- trust measured ball speed on the first frame a threat is seen
 }
 if type(restoreClash) == "boolean" then CONFIG.clashEnabled = restoreClash end
@@ -146,6 +150,11 @@ local parryMissEma = 0               -- 0 = landing everything, higher = missing
 local lastBiasAdjust = 0
 local lastLandDistance = nil         -- ball distance when a parry last confirmed
 local debugLog = {}                  -- [DIAGNOSTIC] recent close-ball frames + block reason
+
+-- ---- Live parry-range calibration (independent of adaptive lead learning) ----
+local rangeFires = {}                -- {t, dist} one per fresh committed parry
+local calibCountSeen = nil           -- ServerParryCount tracked for range learning
+local calibDistMax = 0               -- largest confirmed-parry distance observed
 
 -- BEGIN PARRY MATH (pure functions, also exercised by the regression checks)
 local function finite(n)
@@ -223,16 +232,19 @@ local function advanceApproach(state, closing, distance)
 end
 
 local function interceptionDistance(config, profile, closing, acceleration)
-	local extra = config.earlyParry and config.extraDistance or 0
-	local accelerationMargin = 0
+	-- Reactive trigger: press when the ball, at its CURRENT closing speed, is about
+	-- to enter the standoff buffer within one reaction window (lead = reaction+ping,
+	-- lookAhead = one frame so it cannot slip through between observations). No
+	-- acceleration extrapolation, no early-distance creep -- purely how fast it is
+	-- coming and how close it is right now.
+	local reach = config.standoff + math.max(0, closing) * (profile.lead + (profile.lookAhead or 0))
+	-- Optional extra buffer, and never reach past where a parry actually registers.
+	if config.earlyParry then reach = reach + config.extraDistance end
 	if config.accelerationPrediction then
-		-- Never move the trigger later. Bound extra prediction to three studs
-		-- and 25 ms of travel so a noisy velocity update cannot fire far away.
-		accelerationMargin = math.min(3, math.max(0, closing) * 0.025,
+		reach = reach + math.min(3, math.max(0, closing) * 0.025,
 			0.5 * math.max(0, acceleration) * profile.lead * profile.lead)
 	end
-	return config.contactRadius + extra + math.max(0, closing)
-		* (profile.lead + (profile.lookAhead or 0)) + accelerationMargin
+	return math.min(config.maxParryRange, reach)
 end
 
 local function sampleMotion(state, position, velocity, now, blend, instant)
@@ -612,6 +624,18 @@ Timing:AddToggle({Id = "InstantAcquire", Title = "Instant acquire (first-frame s
 	Description = "Trusts the ball's measured speed on the first frame it is seen, so a stale engine velocity never delays detection.",
 	Callback = function(value) CONFIG.instantAcquire = value end})
 local TuningStatus = Timing:AddParagraph({Title = "Effective settings", Content = "Measuring ping and frame time..."})
+Timing:AddSection("Reactive geometry (how close / how far)")
+Timing:AddSlider({Id = "Standoff", Title = "Standoff buffer (studs)", Default = CONFIG.standoff,
+	Min = 4, Max = 30, Rounding = 0,
+	Description = "Hard minimum gap: the parry fires before the ball can get closer than this. Raise if the ball reaches you; lower if it fires too early.",
+	Callback = function(value) CONFIG.standoff = value end})
+Timing:AddSlider({Id = "MaxParryRange", Title = "Max parry range (studs)", Default = CONFIG.maxParryRange,
+	Min = 40, Max = 120, Rounding = 0,
+	Description = "Furthest distance a parry still registers. Auto-calibrates from confirmed parries when calibration is on.",
+	Callback = function(value) CONFIG.maxParryRange = value end})
+Timing:AddToggle({Id = "CalibrateRange", Title = "Auto-calibrate parry range", Default = CONFIG.calibrateRange,
+	Description = "Learns the real max parry range from confirmed ServerParryCount hits, and pulls it back in if long shots never land.",
+	Callback = function(value) CONFIG.calibrateRange = value end})
 Timing:AddSection("Predictive distance (all modes)")
 Timing:AddToggle({Id = "EarlyParry", Title = "Earlier parry", Default = CONFIG.earlyParry,
 	Callback = function(value) CONFIG.earlyParry = value end})
@@ -666,9 +690,12 @@ local function updateGui()
 	local learnText = CONFIG.adaptiveLearning
 		and string.format("+%.0f ms (miss %.0f%%)", learnedBias * 1000, math.clamp(parryMissEma, 0, 1) * 100)
 		or "off"
-	TuningStatus:SetContent(string.format("%s | Lead: %.0f ms | Retry: %.0f ms\nRange: %s | Close range: %.0f studs\nPing jitter: %.0f ms | Frame budget: %.1f ms\nLearned bias: %s",
+	local calibText = CONFIG.calibrateRange
+		and string.format(" (learned, max hit %.0fst)", calibDistMax) or ""
+	TuningStatus:SetContent(string.format("%s | Lead: %.0f ms | Retry: %.0f ms\nScan: %s | Standoff: %.0f st | Parry range: %.0f st%s\nPing jitter: %.0f ms | Frame budget: %.1f ms\nLearned bias: %s",
 		CONFIG.autoTune and "Automatic" or "Manual", effective.lead * 1000, effective.retry * 1000,
-		rangeText, effective.clashRange, metrics.pingJitter * 1000, effective.frame * 1000, learnText))
+		rangeText, CONFIG.standoff, CONFIG.maxParryRange, calibText,
+		metrics.pingJitter * 1000, effective.frame * 1000, learnText))
 end
 
 -- Fixed Drawing pool. Failure in the optional preview must not stop parrying.
@@ -971,6 +998,40 @@ local function resolveLearning(now)
 	end
 end
 
+-- =====================================================================
+-- Live parry-range calibration. "How far can I actually parry?" is server
+-- authoritative, so learn it: every fresh committed parry records the ball
+-- distance at press time; a ServerParryCount increment confirms that distance
+-- was in range (grow maxParryRange toward it), while a long-distance shot that
+-- never confirms means we fired past the real range (shrink it). This runs
+-- regardless of the adaptive-lead engine.
+-- =====================================================================
+local function updateRangeCalibration(now)
+	if not CONFIG.calibrateRange then return end
+	local count = currentParryCount()
+	if count and calibCountSeen and count > calibCountSeen then
+		for _ = 1, count - calibCountSeen do
+			local f = table.remove(rangeFires, 1)
+			if f then
+				calibDistMax = math.max(calibDistMax, f.dist)
+				-- Sit a few studs beyond the furthest confirmed parry so a genuine
+				-- in-range ball is never rejected, but stay bounded.
+				CONFIG.maxParryRange = math.clamp(math.max(CONFIG.maxParryRange, f.dist + 6), 40, 120)
+			end
+		end
+	end
+	if count ~= nil then calibCountSeen = count end
+	for i = #rangeFires, 1, -1 do
+		if now - rangeFires[i].t > 0.6 then
+			local f = table.remove(rangeFires, i)
+			-- Fired near the current cap yet nothing confirmed: the cap is too far.
+			if f.dist > math.max(calibDistMax, CONFIG.maxParryRange - 8) then
+				CONFIG.maxParryRange = math.clamp(CONFIG.maxParryRange - 2, 40, 120)
+			end
+		end
+	end
+end
+
 -- Helpers are assigned before the update connections are installed.
 local applyPlayerMods, runFeatures, drawFeatureFx, spawnBurst, ballIgnored, curveBall
 
@@ -1113,6 +1174,7 @@ local function attemptThreat(root, threat, now, doSample)
 			if not passesAccuracy() then return end
 			if fireParry() then
 				if CONFIG.adaptiveLearning then pendingFires[#pendingFires + 1] = {t = tick()} end
+				rangeFires[#rangeFires + 1] = {t = tick(), dist = threat.distance}
 				lastParryEnd = tick()
 				parryCount = parryCount + 1
 				lastFireDistance = threat.distance
@@ -1135,6 +1197,7 @@ local function attemptThreat(root, threat, now, doSample)
 		if not previous and CONFIG.adaptiveLearning then
 			pendingFires[#pendingFires + 1] = {t = now}
 		end
+		if not previous then rangeFires[#rangeFires + 1] = {t = now, dist = threat.distance} end
 		if previous then state.retries = (state.retries or 0) + 1 end
 		state.locked = true
 		state.departed, state.departureStart = false, nil
@@ -1157,6 +1220,7 @@ local function update(doSample)
 	if rootId ~= activeRoot then
 		tracked, firedAt = {}, {}
 		pendingFires, lastParryCountSeen = {}, nil
+		rangeFires, calibCountSeen = {}, nil
 		activeRoot, lastClick = rootId, -math.huge
 	end
 	local threat = root and chooseThreat(root, now) or nil
@@ -1166,6 +1230,7 @@ local function update(doSample)
 	-- Heartbeat only does detection/input. Draw once per render callback.
 	if doSample ~= false then
 		resolveLearning(now)
+		updateRangeCalibration(now)
 		pcall(updateGui)
 		updatePreview(root, threat)
 		if root and drawFeatureFx then pcall(drawFeatureFx, root, threat) end
