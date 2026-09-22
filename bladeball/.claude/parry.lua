@@ -113,6 +113,10 @@ local lastPing = 0
 local parryCount = 0
 local menuOpen = true
 local lastUiUpdate = 0
+local lastLearnAt = 0      -- throttle ServerParryCount polling / learning off the hot path
+local lastModsAt = 0       -- throttle player-modification writes
+local fxHidden = false     -- feature-overlay pool currently hidden (skip per-frame resets)
+local frameId = 0          -- increments each update; keys the nearest-ball cache
 local lastFireDistance = nil
 local lastFrameAt = nil
 local lastCleanup = 0
@@ -718,9 +722,22 @@ overlay.future = overlayObject("Circle", {Radius = 5, NumSides = 16, Filled = fa
 overlay.path = overlayObject("Line", {Thickness = 1, Transparency = 0, ZIndex = 10})
 overlay.label = overlayObject("Text", {Size = 13, Font = 2, Outline = true, Center = true, Transparency = 0, ZIndex = 10})
 local previewFailed = false
+local previewObjects = {overlay.hud, overlay.ball, overlay.future, overlay.path, overlay.label}
+local previewHidden = false
 local function drawPreview(root, threat)
-	for _, object in ipairs(overlayObjects) do object.Visible = false end
-	if menuOpen or (type(isrbxactive) == "function" and not isrbxactive()) then return end
+	-- Only ever touch the 5 preview objects (not the whole Drawing pool), and skip
+	-- entirely when there is nothing to show or the menu is open / game unfocused.
+	local active = (CONFIG.compactHud or CONFIG.predictionPreview) and not menuOpen
+		and not (type(isrbxactive) == "function" and not isrbxactive())
+	if not active then
+		if not previewHidden then
+			for _, o in ipairs(previewObjects) do if o then o.Visible = false end end
+			previewHidden = true
+		end
+		return
+	end
+	previewHidden = false
+	for _, o in ipairs(previewObjects) do if o then o.Visible = false end end
 	if CONFIG.compactHud and overlay.hud then
 		local status = not CONFIG.enabled and "OFF" or (not root and "Waiting for round" or "Tracking")
 		local info = threat and string.format("ball %.1fst / trigger %.1fst", threat.distance, threat.triggerDistance) or "no incoming ball"
@@ -950,6 +967,17 @@ local function nearestBallInfo(root)
 	end
 	if best then return best, bestDist end
 	return nil
+end
+
+-- Per-frame cache: trail, indicator, auto-spam, auto-ability and orbit all want
+-- the nearest ball. Scan the Balls folder once per frame, not once per feature.
+local nearestFrame, nearestBall, nearestDist = -1, nil, nil
+local function cachedNearest(root)
+	if frameId ~= nearestFrame then
+		nearestFrame = frameId
+		nearestBall, nearestDist = nearestBallInfo(root)
+	end
+	return nearestBall, nearestDist
 end
 
 -- =====================================================================
@@ -1214,6 +1242,7 @@ end
 local function update(doSample)
 	if not running then return end
 	local now = tick()
+	frameId = frameId + 1
 	if doSample ~= false then samplePerformance(now) end
 	local root = getRoot()
 	local rootId = root and (root.Address or root:GetFullName())
@@ -1229,12 +1258,20 @@ local function update(doSample)
 
 	-- Heartbeat only does detection/input. Draw once per render callback.
 	if doSample ~= false then
-		resolveLearning(now)
-		updateRangeCalibration(now)
+		-- Learning/calibration poll attributes; they do not need every frame.
+		if now - lastLearnAt >= 0.05 then
+			lastLearnAt = now
+			resolveLearning(now)
+			updateRangeCalibration(now)
+		end
 		pcall(updateGui)
 		updatePreview(root, threat)
 		if root and drawFeatureFx then pcall(drawFeatureFx, root, threat) end
-		if applyPlayerMods then pcall(applyPlayerMods) end
+		-- Player mods just write properties; 20 Hz is imperceptible and far cheaper.
+		if applyPlayerMods and now - lastModsAt >= 0.05 then
+			lastModsAt = now
+			pcall(applyPlayerMods)
+		end
 		if root and runFeatures then pcall(runFeatures, now, root, threat) end
 		if now - lastCleanup >= 1 then
 			lastCleanup = now
@@ -1368,7 +1405,7 @@ end
 -- =====================================================================
 local function orbitStep(now, root)
 	if not CONFIG.orbitBall or not root then return end
-	local ball = nearestBallInfo(root)
+	local ball = cachedNearest(root)
 	if not ball then return end
 	orbitAngle = orbitAngle + CONFIG.orbitSpeed * math.clamp(metrics.frame, 1/240, 0.05)
 	local r = CONFIG.orbitRadius
@@ -1389,7 +1426,7 @@ function runFeatures(now, root, threat)
 	end
 	-- Auto spam: parry rapidly while a real ball sits inside the proximity ring.
 	if CONFIG.autoSpam and now - lastSpam >= CONFIG.autoSpamInterval then
-		local ball, dist = nearestBallInfo(root)
+		local ball, dist = cachedNearest(root)
 		if ball and dist <= CONFIG.autoSpamRange then
 			if fireParry() then lastSpam = now; spawnBurst(ball.position) end
 		end
@@ -1400,7 +1437,7 @@ function runFeatures(now, root, threat)
 	end
 	-- Auto ability: fire the equipped ability when a ball closes in.
 	if CONFIG.autoAbility and now - lastAbility >= CONFIG.autoAbilityInterval then
-		local ball, dist = nearestBallInfo(root)
+		local ball, dist = cachedNearest(root)
 		if ball and dist <= CONFIG.autoAbilityRange then
 			useAbility(CONFIG.autoAbilitySecondary)
 			lastAbility = now
@@ -1413,10 +1450,29 @@ end
 -- Feature overlays drawn each frame (trail, indicator, bursts, ESP, HUD).
 -- =====================================================================
 function drawFeatureFx(root, threat)
+	-- Idle fast-path: when no overlay feature is on and no burst is animating,
+	-- hide the whole pool once, then do nothing until something is enabled.
+	local anyFx = CONFIG.ballTrail or CONFIG.ballIndicator or CONFIG.parryHits
+		or CONFIG.parryVisualizer or CONFIG.abilityEsp or CONFIG.customWinstreak
+		or #parryBurst > 0
+	if not anyFx then
+		if not fxHidden then
+			for _, l in ipairs(trailLines) do l.Visible = false end
+			for _, c in ipairs(burstCircles) do c.Visible = false end
+			for _, t in ipairs(espTexts) do t.Visible = false end
+			if fx.indicator then fx.indicator.Visible = false end
+			if fx.winstreak then fx.winstreak.Visible = false end
+			trailPoints = {}
+			fxHidden = true
+		end
+		return
+	end
+	fxHidden = false
+
 	-- Ball trail
 	for _, l in ipairs(trailLines) do l.Visible = false end
 	if CONFIG.ballTrail and root and type(WorldToScreen) == "function" then
-		local ball = nearestBallInfo(root)
+		local ball = cachedNearest(root)
 		if ball then
 			local pt, vis = WorldToScreen(ball.position)
 			if vis then
@@ -1433,7 +1489,7 @@ function drawFeatureFx(root, threat)
 	-- Off-screen / on-screen ball indicator arrow toward the nearest ball.
 	if fx.indicator then fx.indicator.Visible = false end
 	if CONFIG.ballIndicator and root and fx.indicator and type(WorldToScreen) == "function" then
-		local ball = nearestBallInfo(root)
+		local ball = cachedNearest(root)
 		local cam = Workspace.CurrentCamera
 		if ball and cam then
 			local vw, vh = 1920, 1080
