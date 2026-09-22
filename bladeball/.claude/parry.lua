@@ -1105,6 +1105,39 @@ end
 -- [DIAGNOSTIC] read recent close-ball frames after a death.
 _G.BB_PARRY_LOG = function() return debugLog end
 
+-- One-call copyable report: status snapshot + calibration + the last close-ball
+-- frames with fire/block reasons. Run `print(_G.BB_REPORT())`, copy the whole
+-- block, and paste it back. `_G.BB_REPORT(60)` includes the last 60 log lines.
+_G.BB_REPORT = function(lines)
+	lines = tonumber(lines) or 30
+	local out = {}
+	out[#out + 1] = "===== BB PARRY REPORT ====="
+	local s = _G.BB_MATCHA_STATUS and _G.BB_MATCHA_STATUS() or {}
+	out[#out + 1] = string.format(
+		"enabled=%s fps=%.0f ping=%s lead=%.0fms retry=%.0fms",
+		tostring(s.enabled), s.fps or 0,
+		s.pingMs and string.format("%.0fms", s.pingMs) or "n/a",
+		s.leadMs or 0, s.retryMs or 0)
+	out[#out + 1] = string.format(
+		"attempts=%d serverParryCount=%s missRate=%.2f learnedBias=%.0fms",
+		s.attempts or 0, tostring(s.serverParryCount), s.missRate or 0, s.learnedBiasMs or 0)
+	out[#out + 1] = string.format(
+		"maxParryRange=%.0fst maxHitDist=%.0fst standoff=%.0fst clashProx=%.0fst clashInt=%.0fms",
+		CONFIG.maxParryRange, calibDistMax, CONFIG.standoff, CONFIG.clashProximity or 0,
+		CONFIG.clashInterval * 1000)
+	out[#out + 1] = string.format(
+		"anyIncoming=%s fallback=%s accelPred=%s adaptive=%s calibRange=%s",
+		tostring(CONFIG.anyIncoming), tostring(CONFIG.fallback),
+		tostring(CONFIG.accelerationPrediction), tostring(CONFIG.adaptiveLearning),
+		tostring(CONFIG.calibrateRange))
+	out[#out + 1] = string.format("--- last %d close-ball frames (oldest first) ---", lines)
+	local start = math.max(1, #debugLog - lines + 1)
+	for i = start, #debugLog do out[#out + 1] = debugLog[i] end
+	if #debugLog == 0 then out[#out + 1] = "(no close-ball frames logged yet -- play a round)" end
+	out[#out + 1] = "===== END ====="
+	return table.concat(out, "\n")
+end
+
 -- INS-ui exposes no OnUnload hook; guard in case a future build adds one.
 if type(Lib.OnUnload) == "function" then
 	pcall(function()
