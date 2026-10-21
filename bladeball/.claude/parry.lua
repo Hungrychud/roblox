@@ -20,6 +20,9 @@ local CONFIG = {
 	enabled = true,
 	ballsFolder = "Balls",
 	spamInterval = 0.05,          -- ms between parry clicks while the ball targets you
+	spamRange = 60,               -- outer zone: throttled spam when the targeting ball is this near
+	contactRange = 25,            -- inner zone: click EVERY frame (ignore interval) so a press always
+	                              -- lands on the contact frame no matter how fast/curvy the ball is
 	parryMode = "Click",          -- "Click" (mouse1click) or "Touch" (firetouchinterest, experimental)
 	accuracy = 100,               -- % of parry clicks actually taken
 	randomizeAccuracy = false, randomAccMin = 50, randomAccMax = 90,
@@ -121,14 +124,21 @@ local function targetSpamParry(root, now)
 	local folder = Workspace:FindFirstChild(CONFIG.ballsFolder)
 	if not folder then targeting = false; return end
 	local me = player.Name
-	local mine = nil
+	local rootPos = root.Position
+	-- Nearest real ball that targets you.
+	local mine, mineDist = nil, math.huge
 	for _, obj in ipairs(folder:GetChildren()) do
 		local ball = readBall(obj)
-		if ball and ball.real ~= false and ball.target == me then mine = ball; break end
+		if ball and ball.real ~= false and ball.target == me then
+			local d = (rootPos - ball.position).Magnitude
+			if d < mineDist then mine, mineDist = ball, d end
+		end
 	end
-	targeting = mine ~= nil
-	if not mine then return end
-	if now - lastSpamParry < CONFIG.spamInterval then return end
+	targeting = mine ~= nil and mineDist <= CONFIG.spamRange
+	if not targeting then return end
+	-- Inner zone: react to the real position every frame (curve/speed-proof, no
+	-- prediction). Outer zone: throttle so it doesn't swing nonstop while closing.
+	if mineDist > CONFIG.contactRange and now - lastSpamParry < CONFIG.spamInterval then return end
 	if not passesAccuracy() then lastSpamParry = now; return end
 	if fireParry(mine, root) then
 		lastSpamParry = now
@@ -199,6 +209,8 @@ Controls:Toggle("Auto parry", CONFIG.enabled, function(v) CONFIG.enabled = v end
 	"Spam parry while a real ball targets you."):AddKeybind("t", "Toggle")
 Controls:Slider("Spam interval", CONFIG.spamInterval * 1000, 1, 20, 150, " ms",
 	function(v) CONFIG.spamInterval = v / 1000 end)
+Controls:Slider("Spam range", CONFIG.spamRange, 1, 10, 140, " st", function(v) CONFIG.spamRange = v end)
+Controls:Slider("Contact range (every-frame)", CONFIG.contactRange, 1, 5, 80, " st", function(v) CONFIG.contactRange = v end)
 Controls:Slider("Accuracy", CONFIG.accuracy, 1, 0, 100, "%", function(v) CONFIG.accuracy = v end)
 Controls:Toggle("Parry via touch (experimental)", CONFIG.parryMode == "Touch",
 	function(v) CONFIG.parryMode = v and "Touch" or "Click" end,
@@ -238,11 +250,19 @@ local heartbeatConnection = nil
 if RunService.Heartbeat and RunService.Heartbeat ~= renderSignal then
 	heartbeatConnection = RunService.Heartbeat:Connect(update)
 end
+-- Pre-physics pass: ball position updates here too. Three passes/frame shrink the
+-- gap between samples so a 240+ speed ball can't cross the contact zone unseen.
+local preSimConnection = nil
+if RunService.PreSimulation and RunService.PreSimulation ~= renderSignal
+	and RunService.PreSimulation ~= RunService.Heartbeat then
+	preSimConnection = RunService.PreSimulation:Connect(update)
+end
 
 _G.BB_MATCHA_STOP = function()
 	running = false
 	if renderConnection then renderConnection:Disconnect() end
 	if heartbeatConnection then heartbeatConnection:Disconnect() end
+	if preSimConnection then preSimConnection:Disconnect() end
 	pcall(function() Lib:Destroy() end)
 	_G.BB_MATCHA_STOP = nil
 	_G.BB_MATCHA_STATUS = nil
