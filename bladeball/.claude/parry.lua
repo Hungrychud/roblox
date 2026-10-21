@@ -10,6 +10,7 @@
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local player = Players.LocalPlayer
 assert(player, "LocalPlayer is unavailable; run this as a client script")
@@ -23,7 +24,8 @@ local CONFIG = {
 	spamRange = 60,               -- outer zone: throttled spam when the targeting ball is this near
 	contactRange = 25,            -- inner zone: click EVERY frame (ignore interval) so a press always
 	                              -- lands on the contact frame no matter how fast/curvy the ball is
-	parryMode = "Click",          -- "Click" (mouse1click) or "Touch" (firetouchinterest, experimental)
+	parryMode = "Remote",         -- "Remote" (net parry RemoteEvent:FireServer(true) -- focus-independent,
+	                              -- no sword swing), "Click" (mouse1click), "Touch" (firetouchinterest, experimental)
 	accuracy = 100,               -- % of parry clicks actually taken
 	randomizeAccuracy = false, randomAccMin = 50, randomAccMax = 90,
 	-- Interactions (executor fns)
@@ -87,7 +89,23 @@ local function getRoot()
 end
 
 -- ---- Parry input ----
+-- Blade Ball parry RemoteEvent (from Remote Spy): a sleitnick-net RE fired with a
+-- single boolean. Resolved once; the obfuscated name can change on game updates,
+-- so a nil result falls back to mouse1click.
+local parryRemote
+pcall(function()
+	local pkgs = ReplicatedStorage:FindFirstChild("Packages")
+	local idx = pkgs and pkgs:FindFirstChild("_Index")
+	local sl = idx and idx:FindFirstChild("sleitnick_net@0.1.0")
+	local net = sl and sl:FindFirstChild("net")
+	parryRemote = net and net:FindFirstChild(
+		"RE/a7e95fad55babeade0506d1ab663c0f121a12316263d5acd614d34ac2e76e945")
+end)
+
 local function fireParry(ball, root)
+	if CONFIG.parryMode == "Remote" and parryRemote then
+		return (pcall(function() parryRemote:FireServer(true) end))
+	end
 	if CONFIG.parryMode == "Touch" and type(firetouchinterest) == "function"
 		and ball and ball.part and root then
 		-- EXPERIMENTAL: a touch registers the ball as HITTING you, not a parry.
@@ -212,6 +230,9 @@ Controls:Slider("Spam interval", CONFIG.spamInterval * 1000, 1, 20, 150, " ms",
 Controls:Slider("Spam range", CONFIG.spamRange, 1, 10, 140, " st", function(v) CONFIG.spamRange = v end)
 Controls:Slider("Contact range (every-frame)", CONFIG.contactRange, 1, 5, 80, " st", function(v) CONFIG.contactRange = v end)
 Controls:Slider("Accuracy", CONFIG.accuracy, 1, 0, 100, "%", function(v) CONFIG.accuracy = v end)
+Controls:Toggle("Parry via remote (recommended)", CONFIG.parryMode == "Remote",
+	function(v) CONFIG.parryMode = v and "Remote" or "Click" end,
+	"Fire the game's parry RemoteEvent directly. Focus-independent, no sword swing. Off = mouse1click. Falls back to mouse1click if the remote isn't found.")
 Controls:Toggle("Parry via touch (experimental)", CONFIG.parryMode == "Touch",
 	function(v) CONFIG.parryMode = v and "Touch" or "Click" end,
 	"Fire the ball's TouchInterest instead of mouse1click. In Blade Ball a touch registers as a HIT, not a parry -- leave OFF for real play.")
@@ -270,7 +291,8 @@ end
 
 _G.BB_MATCHA_STATUS = function()
 	return {enabled = CONFIG.enabled, menuOpen = menuOpen, targeting = targeting,
-		attempts = parryCount, spamIntervalMs = CONFIG.spamInterval * 1000, parryMode = CONFIG.parryMode}
+		attempts = parryCount, spamIntervalMs = CONFIG.spamInterval * 1000,
+		parryMode = CONFIG.parryMode, parryRemoteFound = parryRemote ~= nil}
 end
 
 print("Target-spam auto-parry loaded (P menu, T toggle)")
