@@ -97,6 +97,12 @@ local CONFIG = {
 	orbitBall = false, orbitKey = "H", orbitRadius = 8, orbitSpeed = 3,
 	immortality = false,
 
+	-- ---- Interactions (new executor fns: fireproximityprompt / fireclickdetector) ----
+	autoPrompt = false, autoPromptRange = 20, autoPromptInterval = 0.4,
+	autoClick = false, autoClickRange = 20, autoClickInterval = 0.4,
+	-- parryMode "Touch" fires the ball's TouchInterest (firetouchinterest) instead of
+	-- mouse1click. In Blade Ball a touch registers as a HIT, not a parry -- experimental.
+
 	-- ---- Accuracy engine (outside-the-box) ----
 	adaptiveLearning = true,   -- self-tune lead earlier from live ServerParryCount misses (bounded)
 	velocityBlend = true,      -- never under-estimate ball speed (positional derivative)
@@ -418,6 +424,22 @@ StatusSec:Button("Unload script", function()
 	if _G.BB_MATCHA_STOP then _G.BB_MATCHA_STOP() end
 end)
 
+-- ======================= INTERACTIONS =======================
+local Interact = Window:Tab("Interactions", "wrench")
+local InteractSec = Interact:Section("Auto interact", "Left",
+	"Fire nearby ProximityPrompts and ClickDetectors (lobby/shop/pickups).")
+InteractSec:Toggle("Auto proximity prompts", CONFIG.autoPrompt, function(v) CONFIG.autoPrompt = v end,
+	"fireproximityprompt on every ProximityPrompt within range of you.")
+InteractSec:Slider("Prompt range", CONFIG.autoPromptRange, 1, 5, 80, " st", function(v) CONFIG.autoPromptRange = v end)
+InteractSec:Toggle("Auto click detectors", CONFIG.autoClick, function(v) CONFIG.autoClick = v end,
+	"fireclickdetector (MouseClick) on every ClickDetector within range of you.")
+InteractSec:Slider("Click range", CONFIG.autoClickRange, 1, 5, 80, " st", function(v) CONFIG.autoClickRange = v end)
+
+local ExpSec = Interact:Section("Experimental", "Right", "Alternate parry input -- test only.")
+ExpSec:Toggle("Parry via touch (experimental)", CONFIG.parryMode == "Touch",
+	function(v) CONFIG.parryMode = v and "Touch" or "Click" end,
+	"Fires the ball's TouchInterest (firetouchinterest) instead of mouse1click. WARNING: a touch registers the ball as HITTING you, not a parry -- this will likely get you hit. Leave OFF for real play.")
+
 -- No menu-open pause: parry stays active while the menu is visible. Firing
 -- mouse1click is independent of the Drawing menu, so this only adds coverage.
 menuOpen = false
@@ -629,7 +651,18 @@ local function ballKey(ball)
 	return ball.object:GetFullName()
 end
 
-local function fireParry()
+local function fireParry(threat, root)
+	-- Experimental: fire the ball's TouchInterest instead of clicking. NOTE: in
+	-- Blade Ball a touch registers the ball as HITTING you, not a parry -- this is
+	-- here because the user asked; keep parryMode "Click" for real play.
+	if CONFIG.parryMode == "Touch" and type(firetouchinterest) == "function"
+		and threat and threat.ball and threat.ball.part and root then
+		local ok = pcall(function()
+			firetouchinterest(root, threat.ball.part, 0) -- 0 = Touch
+			firetouchinterest(root, threat.ball.part, 1) -- 1 = Untouch
+		end)
+		return ok
+	end
 	-- Matcha does not allow :Fire() on the game's BindableEvents, so both parry
 	-- modes go through the real left-click path (the game turns MouseButton1 into
 	-- ParryAttempt itself). The dropdown is kept for non-Matcha executors.
@@ -829,6 +862,61 @@ local function updateRangeCalibration(now)
 	end
 end
 
+-- =====================================================================
+-- Auto interactions (new executor fns). Fire ProximityPrompts and
+-- ClickDetectors within range of the player. Both toggles default OFF.
+-- =====================================================================
+local lastInteract = -math.huge
+local function instanceWorldPos(inst)
+	-- Walk up to the nearest BasePart/Attachment to get a world position.
+	local node = inst.Parent
+	for _ = 1, 4 do
+		if not node then return nil end
+		local isPart = pcall(function() return node.ClassName end) and
+			(node.ClassName == "Part" or node.ClassName == "MeshPart"
+			or node.ClassName == "UnionOperation" or node.ClassName == "Seat"
+			or node.ClassName == "VehicleSeat")
+		if isPart then
+			local ok, pos = pcall(function() return node.Position end)
+			if ok and pos then return pos end
+		end
+		local okA, isAtt = pcall(function() return node.ClassName == "Attachment" end)
+		if okA and isAtt then
+			local ok, pos = pcall(function() return node.WorldPosition end)
+			if ok and pos then return pos end
+		end
+		node = node.Parent
+	end
+	return nil
+end
+
+local function runInteractions(root, now)
+	if not root or (not CONFIG.autoPrompt and not CONFIG.autoClick) then return end
+	local interval = math.min(CONFIG.autoPromptInterval, CONFIG.autoClickInterval)
+	if now - lastInteract < interval then return end
+	lastInteract = now
+	local rootPos = root.Position
+	-- shortcut: full Workspace descendant scan each interval; cheap enough while
+	-- gated behind an off-by-default toggle. Upgrade to a cached/DescendantAdded
+	-- list if it lags on large places.
+	local ok, descendants = pcall(function() return Workspace:GetDescendants() end)
+	if not ok or not descendants then return end
+	for _, d in ipairs(descendants) do
+		local cls = d.ClassName
+		if cls == "ProximityPrompt" and CONFIG.autoPrompt and type(fireproximityprompt) == "function" then
+			local pos = instanceWorldPos(d)
+			if pos and (rootPos - pos).Magnitude <= CONFIG.autoPromptRange then
+				pcall(fireproximityprompt, d)
+			end
+		elseif cls == "ClickDetector" and CONFIG.autoClick and type(fireclickdetector) == "function" then
+			local pos = instanceWorldPos(d)
+			if pos and (rootPos - pos).Magnitude <= CONFIG.autoClickRange then
+				pcall(fireclickdetector, d, 0, "MouseClick")
+			end
+		end
+	end
+end
+
 -- Helpers are assigned before the update connections are installed.
 local applyPlayerMods, runFeatures, drawFeatureFx, spawnBurst, ballIgnored, curveBall
 
@@ -943,7 +1031,7 @@ local function attemptThreat(root, threat, now, doSample)
 		-- Kill pre click: allow one early blind click on a fast, nearby ball.
 		if CONFIG.killPreClick and threat.ball.speed >= CONFIG.preClickBallSpeed
 			and threat.distance <= CONFIG.preClickRange and now - lastClick >= effective.interval then
-			if passesAccuracy() and fireParry() then lastClick = now end
+			if passesAccuracy() and fireParry(threat, root) then lastClick = now end
 		end
 		return
 	end
@@ -976,7 +1064,7 @@ local function attemptThreat(root, threat, now, doSample)
 			if not CONFIG.enabled or menuOpen then return end
 			if type(isrbxactive) == "function" and not isrbxactive() then return end
 			if not passesAccuracy() then return end
-			if fireParry() then
+			if fireParry(threat, root) then
 				if CONFIG.adaptiveLearning then pendingFires[#pendingFires + 1] = {t = tick()} end
 				rangeFires[#rangeFires + 1] = {t = tick(), dist = threat.distance}
 				lastParryEnd = tick()
@@ -995,7 +1083,7 @@ local function attemptThreat(root, threat, now, doSample)
 		state.locked, state.departed, state.departureStart, state.lastDistance = true, false, nil, threat.distance
 		return
 	end
-	if fireParry() then
+	if fireParry(threat, root) then
 		-- One learning marker per fresh committed shot (not per close-range retry),
 		-- so a single ServerParryCount increment maps to a single intended parry.
 		if not previous and CONFIG.adaptiveLearning then
@@ -1040,7 +1128,8 @@ local function update(doSample)
 			resolveLearning(now)
 			updateRangeCalibration(now)
 		end
-		pcall(updateGui)
+		pcall(runInteractions, root, now)
+			pcall(updateGui)
 		updatePreview(root, threat)
 		if now - lastCleanup >= 1 then
 			lastCleanup = now
